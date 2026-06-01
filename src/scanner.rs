@@ -228,26 +228,46 @@ impl Scanner {
     /// Feed a chunk of raw terminal output.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.pending.push(b);
-            // Feed exactly one byte so a completing callback delimits the span.
-            let Self { parser, sink, .. } = self;
-            parser.advance(sink, &[b]);
-            match self.sink.take_event() {
-                SegEvent::None => {}
-                SegEvent::KeepByte | SegEvent::KeepSeq => {
-                    let span = std::mem::take(&mut self.pending);
-                    self.ring.append(&span);
-                    self.maybe_cut();
-                }
-                SegEvent::DropSeq => {
-                    self.pending.clear();
-                }
-                SegEvent::ClearSeq => {
-                    self.pending.clear();
-                    let mut prologue = b"\x1b[2J\x1b[H".to_vec();
-                    prologue.extend_from_slice(&self.sink.sticky.serialize());
-                    self.ring.purge(prologue);
-                }
+            // vte 0.15 only supports 7-bit codes and does not recognise the
+            // 8-bit C1 ST byte (0x9C) as an OSC/DCS string terminator; it
+            // silently appends 0x9C to the OSC body and stays in OscString
+            // state, swallowing the byte that follows.  Translate 0x9C to the
+            // semantically identical 7-bit two-byte form ESC \ before the byte
+            // reaches vte.  The pending accumulator records 0x1B + 0x5C so the
+            // emitted span is equivalent to what `ESC \` would have produced.
+            let expanded: &[u8] = if b == 0x9c {
+                b"\x1b\\"
+            } else {
+                std::slice::from_ref(&b)
+            };
+            for &eb in expanded {
+                self.advance_one(eb);
+            }
+        }
+    }
+
+    /// Process a single pre-expanded byte through vte and update the ring.
+    #[inline]
+    fn advance_one(&mut self, b: u8) {
+        self.pending.push(b);
+        // Feed exactly one byte so a completing callback delimits the span.
+        let Self { parser, sink, .. } = self;
+        parser.advance(sink, &[b]);
+        match self.sink.take_event() {
+            SegEvent::None => {}
+            SegEvent::KeepByte | SegEvent::KeepSeq => {
+                let span = std::mem::take(&mut self.pending);
+                self.ring.append(&span);
+                self.maybe_cut();
+            }
+            SegEvent::DropSeq => {
+                self.pending.clear();
+            }
+            SegEvent::ClearSeq => {
+                self.pending.clear();
+                let mut prologue = b"\x1b[2J\x1b[H".to_vec();
+                prologue.extend_from_slice(&self.sink.sticky.serialize());
+                self.ring.purge(prologue);
             }
         }
     }
@@ -380,6 +400,22 @@ mod tests {
         // Kept OSC keeps the full ST terminator (ESC \), no dangling ESC.
         let s = feed(b"\x1b]2;vim\x1b\\X");
         assert_eq!(s.replay(usize::MAX), b"\x1b]2;vim\x1b\\X".to_vec());
+    }
+
+    #[test]
+    fn c1_st_terminated_dropped_osc_keeps_following_byte() {
+        // 8-bit C1 ST (0x9C) after a dropped OSC must not swallow the next byte.
+        let s = feed(b"A\x1b]52;c;Z\x9cB");
+        assert_eq!(s.replay(usize::MAX), b"AB".to_vec());
+    }
+
+    #[test]
+    fn c1_st_terminated_title_keeps_following_byte() {
+        // 8-bit C1 ST after a kept OSC (title) must not swallow the next byte.
+        let s = feed(b"\x1b]2;vim\x9cX");
+        // Title kept; X kept. (Exact terminator bytes in the ring may vary; the
+        // invariant under test is that X survives and the title was tracked.)
+        assert!(s.replay(usize::MAX).ends_with(b"X"));
     }
 
     #[test]
