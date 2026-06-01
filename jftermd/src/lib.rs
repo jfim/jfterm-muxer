@@ -7,5 +7,6 @@
 pub mod protocol;
 pub mod pty;
 pub mod registry;
+pub mod server;
 pub mod session;
 pub mod socket;
