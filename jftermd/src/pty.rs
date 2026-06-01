@@ -45,6 +45,11 @@ pub struct Pty {
 impl Pty {
     /// `forkpty` a shell: `argv[0]` is exec'd via PATH, cwd set, `TERM`
     /// forced to `xterm-256color`, master left non-blocking.
+    ///
+    /// B2 note: this blocks briefly (a bounded pgid-readiness spin, ~1ms
+    /// typical, 200ms worst case) so it MUST NOT be called directly on the
+    /// tokio event-loop thread — wrap it in `spawn_blocking` or redesign the
+    /// process-group barrier to be non-blocking.
     pub fn spawn(argv: &[String], cwd: &Path, ws: Winsize) -> io::Result<Self> {
         // Build argv/env/cwd C strings in the PARENT — the child path between
         // fork and exec must use only async-signal-safe calls (no allocation,
