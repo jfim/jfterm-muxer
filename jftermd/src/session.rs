@@ -30,19 +30,6 @@ pub struct DrainOutcome {
     pub exit: Option<i32>,
 }
 
-impl Default for DrainOutcome {
-    fn default() -> Self {
-        Self {
-            data: Vec::new(),
-            status: StatusSnapshot {
-                running: false,
-                progress: None,
-            },
-            exit: None,
-        }
-    }
-}
-
 /// The replay handshake payload for an attaching client.
 #[derive(Debug)]
 pub struct AttachReplay {
@@ -167,7 +154,11 @@ impl Session {
         }
         self.pty.hangup()?;
         // Drain any final output into the engine before reaping.
-        let _ = self.pty.drain();
+        if let Ok(final_out) = self.pty.drain()
+            && !final_out.bytes.is_empty()
+        {
+            self.engine.feed(&final_out.bytes);
+        }
         let mut status = 0;
         for _ in 0..200 {
             if let Some(s) = self.pty.try_reap()? {
@@ -277,6 +268,29 @@ mod tests {
         assert_eq!(info.cwd, "/home");
         assert!(info.running);
         assert!(info.has_client);
+    }
+
+    #[test]
+    fn close_feeds_final_output_into_replay() {
+        // Shell prints a line then waits on stdin; close() must capture that
+        // final output into the replay even though we never drained it live.
+        let mut s = Session::open(
+            "tclose",
+            argv(&["sh", "-c", "echo final-banner; exec cat"]),
+            "/",
+            80,
+            24,
+        )
+        .expect("open");
+        // Give the shell a moment to emit the banner (do NOT drain it here).
+        std::thread::sleep(Duration::from_millis(200));
+        s.close().expect("close");
+        let replay = s.replay_for_attach(0);
+        assert!(
+            replay.data.windows(12).any(|w| w == b"final-banner"),
+            "close() did not feed final output into replay; got {:?}",
+            String::from_utf8_lossy(&replay.data)
+        );
     }
 
     #[test]
