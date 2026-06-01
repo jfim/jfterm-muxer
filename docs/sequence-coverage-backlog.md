@@ -41,6 +41,39 @@ re-asserting on reattach is desired or spurious.
 | Focus reporting | `?1004` | Same as mouse. |
 | Alt screen | `?1049` (`?47`/`?1047`) | A cut landing mid-alt-screen makes a *capped* replay enter the alt screen without reconstructing its drawn content. Options: (a) don't sticky-track alt-screen; (b) treat alt-screen enter as a purge-like boundary; (c) stop buffering alt-screen churn and rely on SIGWINCH repaint (per the spec's alt-screen note). |
 
+### Design note: the state-prologue model has limits for side-effecting modes
+
+The per-chunk state prologue (an initial-state snapshot re-asserted at the start
+of a replayed chunk) is correct for **inert, value-only properties** — SGR color,
+charset, scroll region, cwd, title. Re-asserting the latest value is harmless
+because the property has no side effect beyond "this is the current value," and
+in-data transitions carry it forward.
+
+It is **not** sufficient for **modes with side effects / client behavior** —
+mouse reporting, focus reporting, bracketed paste. For these the property isn't a
+passive value: having it enabled changes what the client sends back, so a
+transient enable during replay actually matters.
+
+Two distinct cases, and neither a plain prologue nor a prologue-diff fully solves:
+
+- **Stale prologue.** A chunk's frozen prologue captures a mode as ON, but it was
+  turned OFF later. A diff of the prologue snapshot against the chunk's end (or
+  the live state for the open chunk) can drop the stale entry. This is the
+  cheap, prologue-only fix.
+- **In-buffer span (the hard case).** A mode is enabled and disabled *within the
+  buffered byte stream* — e.g. mouse reporting on from offset 1000 to 8000 inside
+  a chunk's `data`. Those toggles live in the data as verbatim bytes; a
+  prologue-level diff cannot remove them, so replaying the data still re-creates a
+  transient enable window. Properly avoiding this needs **design**, not a tweak.
+
+Likely direction (to be designed in this pass): split sticky state into
+**positional/rendering** state (journey matters → keep inline in data + frozen
+prologue, as today) vs **input-behavior** modes (non-positional, only the current
+value matters → drop their toggles from the ring data entirely, track the current
+value, and emit it once at replay time from the live state). The second bucket
+sidesteps both cases above but is more invasive than the prologue, so it warrants
+explicit design before implementation.
+
 ## Group C — visual modes NOT tracked in the prologue (capped replay renders wrong)
 
 Kept inline in the data stream but not re-asserted by `StickyState::serialize`,
