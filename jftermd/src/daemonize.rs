@@ -65,6 +65,11 @@ pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire>
 }
 
 /// `setsid` + double-fork into a daemon; `chdir("/")`; std fds -> `/dev/null`.
+///
+/// MUST be called BEFORE constructing any tokio runtime or spawning threads:
+/// `fork()` only carries the calling thread into the child, so forking after a
+/// multi-thread runtime exists would leave the child with a broken runtime
+/// (locks held by threads that no longer exist).
 pub fn daemonize() -> io::Result<()> {
     use nix::unistd::{ForkResult, chdir, fork, setsid};
 
@@ -85,17 +90,30 @@ pub fn daemonize() -> io::Result<()> {
 }
 
 fn redirect_std_to_devnull() -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let devnull = OpenOptions::new()
+    use std::os::fd::IntoRawFd;
+    // Take ownership of the raw fd so its `File` drop can't close it out from
+    // under us. If the process started with 0/1/2 already closed, `open` may
+    // hand back one of those very fds — in that case we must NOT close the
+    // source at the end, or we'd re-close the std fd we just set up.
+    let src = OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/null")?;
-    let fd = devnull.as_raw_fd();
-    // SAFETY: dup2 onto the three std fds; fd is a valid open /dev/null.
+        .open("/dev/null")?
+        .into_raw_fd();
+    // SAFETY: dup2 onto the three std fds; `src` is a valid open /dev/null.
+    // dup2(src, src) is a no-op, so skipping it leaves that std fd open.
     for target in 0..=2 {
-        if unsafe { libc::dup2(fd, target) } < 0 {
-            return Err(io::Error::last_os_error());
+        if src != target && unsafe { libc::dup2(src, target) } < 0 {
+            let e = io::Error::last_os_error();
+            if src > 2 {
+                unsafe { libc::close(src) };
+            }
+            return Err(e);
         }
+    }
+    // Close the source only when it isn't one of the std fds we just wired up.
+    if src > 2 {
+        unsafe { libc::close(src) };
     }
     Ok(())
 }
