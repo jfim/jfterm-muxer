@@ -1,0 +1,7 @@
+[package]
+name = "jftermd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jftermd-core = { path = "../core" }

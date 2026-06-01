@@ -1,0 +1,13 @@
+# Pinned dependency versions (verified 2026-06-01):
+#   vte  = 0.15.0  — Parser::new() -> Parser, advance(&mut self, performer: &mut P, bytes: &[u8])
+#   vt100 = 0.16.2  — dev dependency for integration tests
+[package]
+name = "jftermd-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vte = "0.15.0"
+
+[dev-dependencies]
+vt100 = "0.16.2"
