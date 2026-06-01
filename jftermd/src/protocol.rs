@@ -66,6 +66,11 @@ impl Frame {
 
     /// Serialize to the wire: `[type][len:u32 BE][value]`.
     pub fn encode(&self) -> Vec<u8> {
+        debug_assert!(
+            self.payload.len() <= MAX_FRAME_LEN as usize,
+            "frame payload {} exceeds MAX_FRAME_LEN",
+            self.payload.len()
+        );
         let len = self.payload.len();
         let mut out = Vec::with_capacity(5 + len);
         out.push(self.ty as u8);
@@ -196,6 +201,15 @@ impl Frame {
     }
 }
 
+/// Split raw output bytes into one or more `Data` frames, each at most
+/// `MAX_FRAME_LEN` bytes, so a large replay never trips the frame cap.
+pub fn frame_data(bytes: &[u8]) -> Vec<Frame> {
+    bytes
+        .chunks(MAX_FRAME_LEN as usize)
+        .map(|c| Frame::new(FrameType::Data, c.to_vec()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +312,25 @@ mod tests {
         let frame = Frame::control(FrameType::Hello, &msg).unwrap();
         let back: Hello = frame.json().unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn frame_data_splits_oversized_payload_into_max_sized_frames() {
+        let big = vec![0xABu8; MAX_FRAME_LEN as usize + 1];
+        let frames = frame_data(&big);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].payload.len(), MAX_FRAME_LEN as usize);
+        assert_eq!(frames[1].payload.len(), 1);
+        assert!(frames.iter().all(|f| f.ty == FrameType::Data));
+        let mut joined = Vec::new();
+        for f in &frames {
+            joined.extend_from_slice(&f.payload);
+        }
+        assert_eq!(joined, big);
+    }
+
+    #[test]
+    fn frame_data_empty_input_yields_no_frames() {
+        assert!(frame_data(&[]).is_empty());
     }
 }
