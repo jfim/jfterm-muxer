@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jftermd::protocol::{
-    AttachOrOpen, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, SessionInfo,
+    AttachOrOpen, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, SessionInfo,
 };
 use jftermd::registry::Registry;
 use jftermd::server::{ServerOpts, run};
@@ -272,4 +272,109 @@ async fn second_attach_takes_over_and_kicks_first() {
         .await;
     let got = recv_data_until(&mut c2, b"AFTER", Duration::from_secs(3)).await;
     assert!(contains(&got, b"AFTER"));
+}
+
+#[tokio::test]
+async fn backpressure_drops_stalled_client_without_disturbing_shell() {
+    // Tiny out-queue so a non-reading client overflows quickly.
+    let opts = ServerOpts {
+        out_queue: 4,
+        ..ServerOpts::default()
+    };
+    let h = Harness::start(opts).await;
+
+    let mut c1 = h.connect().await;
+    c1.send(&attach_or_open(
+        "bp",
+        argv(&["sh", "-c", "yes BLAH | head -c 2000000; exec cat"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+
+    // Do NOT read c1: the bounded out-queue overflows and the daemon drops it.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !h.registry.is_empty(),
+        "backpressure must not kill the shell"
+    );
+
+    // c1 is force-detached: draining it reaches EOF.
+    let mut hit_eof = false;
+    for _ in 0..100000 {
+        if c1.recv(Duration::from_secs(2)).await.is_none() {
+            hit_eof = true;
+            break;
+        }
+    }
+    assert!(hit_eof, "stalled client should be force-detached (EOF)");
+
+    // The shell stays responsive for a fresh client (cap replay to keep it fast).
+    let mut c2 = h.connect().await;
+    c2.send(&attach_or_open("bp", argv(&["true"]), 1, 80, 24))
+        .await;
+    c2.send(&Frame::new(FrameType::Input, b"ALIVE\n".to_vec()))
+        .await;
+    let got = recv_data_until(&mut c2, b"ALIVE", Duration::from_secs(3)).await;
+    assert!(
+        contains(&got, b"ALIVE"),
+        "shell unresponsive after backpressure drop"
+    );
+}
+
+#[tokio::test]
+async fn shell_exit_while_detached_retains_dead_session_then_replays_exit() {
+    let h = Harness::start(ServerOpts {
+        dead_grace: Duration::from_secs(10),
+        ..ServerOpts::default()
+    })
+    .await;
+
+    let mut c = h.connect().await;
+    c.send(&attach_or_open(
+        "dead",
+        argv(&["sh", "-c", "sleep 0.3; echo LASTLINE; exit 7"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    // Detach BEFORE the shell exits.
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!h.registry.is_empty(), "dead session must be retained");
+
+    // Reattach: replay final output + EXIT{7}, then the session is dropped.
+    let mut c2 = h.connect().await;
+    c2.send(&attach_or_open("dead", argv(&["true"]), 0, 80, 24))
+        .await;
+    let mut saw_last = false;
+    let mut exit_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match c2.recv(remaining).await {
+            Some(f) if f.ty == FrameType::Data && contains(&f.payload, b"LASTLINE") => {
+                saw_last = true;
+            }
+            Some(f) if f.ty == FrameType::Exit => {
+                let m: ExitMsg = f.json().unwrap();
+                exit_code = Some(m.status);
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(saw_last, "reattach must replay final output");
+    assert_eq!(exit_code, Some(7));
+    wait_until(Duration::from_secs(3), || h.registry.is_empty()).await;
+    assert!(
+        h.registry.is_empty(),
+        "dead session dropped after reattach replay"
+    );
 }
