@@ -30,6 +30,10 @@ jfterm-muxer/
 
 Each module has one responsibility. `ring.rs` is dumb storage (it never parses). `sticky.rs` and `status.rs` are pure state holders. `scanner.rs` is the only module that knows escape-sequence semantics. `engine.rs` is the thin public API Plan B builds on.
 
+## Workflow
+
+Tooling is set up in Task 0: `rustfmt`, `clippy` (as `-D warnings`), and a `justfile`. **Before every commit, run `just check && just test`** (format check + clippy + tests). Use `just fmt` to autoformat. Each task below ends in a commit, so each task is gated by a green `just check && just test`.
+
 ---
 
 ## Task 0: Scaffold the crate and pin/verify the parser API
@@ -101,16 +105,58 @@ Add a temporary stub to each so `cargo build` succeeds:
 ```
 (Empty files are valid Rust modules; no stub content is required.)
 
-- [ ] **Step 6: Verify it builds**
+- [ ] **Step 6: Ensure rustfmt + clippy are installed and add a rustfmt config**
 
-Run: `cargo build`
-Expected: PASS (warnings about unused modules are fine).
+Run:
+```bash
+rustup component add rustfmt clippy
+```
+Create `rustfmt.toml`:
+```toml
+edition = "2021"
+max_width = 100
+```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Add a justfile**
+
+Create `justfile`:
+```just
+# Default: lint + test
+default: check test
+
+# Autoformat
+fmt:
+    cargo fmt
+
+# Format check + clippy as hard errors (run before every commit)
+check:
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+
+# Run the test suite
+test:
+    cargo test
+
+# Debug build
+build:
+    cargo build
+```
+
+- [ ] **Step 8: Verify build, lint, and tests all pass**
+
+Run:
+```bash
+just build
+just check
+just test
+```
+Expected: all PASS. (At this stage there are no tests yet; `just test` reports 0 tests, which is success. `just check` must be clean — empty modules produce no clippy/format errors.)
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock src/
-git commit -m "chore: scaffold jftermd-core crate with vte + vt100"
+git add Cargo.toml Cargo.lock rustfmt.toml justfile src/
+git commit -m "chore: scaffold jftermd-core crate with vte + vt100, rustfmt, clippy, just"
 ```
 
 ---
