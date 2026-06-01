@@ -31,8 +31,6 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    // used by the FrameDecoder in the next task
-    #[allow(dead_code)]
     fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             1 => Self::Hello,
@@ -75,6 +73,65 @@ impl Frame {
     }
 }
 
+/// Errors from decoding a frame stream. Either closes the connection (B2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolError {
+    /// Type byte did not map to a known `FrameType`.
+    UnknownType(u8),
+    /// Declared value length exceeded `MAX_FRAME_LEN`.
+    FrameTooLarge(u32),
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownType(b) => write!(f, "unknown frame type byte {b}"),
+            Self::FrameTooLarge(n) => write!(f, "frame length {n} exceeds cap"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+/// Accumulates bytes off a socket and yields whole `Frame`s. Handles frames
+/// split across reads and multiple frames in one read.
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append freshly-read bytes to the internal buffer.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Pop the next complete frame, or `Ok(None)` if more bytes are needed.
+    /// A malformed type byte or oversized length is a hard `Err`.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
+        if self.buf.len() < 5 {
+            return Ok(None);
+        }
+        let ty_byte = self.buf[0];
+        let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
+        if len > MAX_FRAME_LEN {
+            return Err(ProtocolError::FrameTooLarge(len));
+        }
+        let ty = FrameType::from_u8(ty_byte).ok_or(ProtocolError::UnknownType(ty_byte))?;
+        let total = 5 + len as usize;
+        if self.buf.len() < total {
+            return Ok(None);
+        }
+        let payload = self.buf[5..total].to_vec();
+        self.buf.drain(..total);
+        Ok(Some(Frame::new(ty, payload)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +147,52 @@ mod tests {
     fn encode_empty_payload() {
         let f = Frame::new(FrameType::List, Vec::new());
         assert_eq!(f.encode(), vec![3, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_round_trip() {
+        let f = Frame::new(FrameType::Data, b"hello".to_vec());
+        let mut d = FrameDecoder::new();
+        d.push(&f.encode());
+        assert_eq!(d.next_frame().unwrap(), Some(f));
+        assert_eq!(d.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn decode_partial_then_complete() {
+        let wire = Frame::new(FrameType::Input, b"abc".to_vec()).encode();
+        let mut d = FrameDecoder::new();
+        d.push(&wire[..3]); // header not even complete
+        assert_eq!(d.next_frame().unwrap(), None);
+        d.push(&wire[3..]);
+        assert_eq!(
+            d.next_frame().unwrap(),
+            Some(Frame::new(FrameType::Input, b"abc".to_vec()))
+        );
+    }
+
+    #[test]
+    fn decode_two_frames_in_one_push() {
+        let mut wire = Frame::new(FrameType::Status, b"x".to_vec()).encode();
+        wire.extend(Frame::new(FrameType::Exit, b"y".to_vec()).encode());
+        let mut d = FrameDecoder::new();
+        d.push(&wire);
+        assert_eq!(d.next_frame().unwrap().unwrap().ty, FrameType::Status);
+        assert_eq!(d.next_frame().unwrap().unwrap().ty, FrameType::Exit);
+        assert_eq!(d.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn decode_unknown_type_errors() {
+        let mut d = FrameDecoder::new();
+        d.push(&[200, 0, 0, 0, 0]);
+        assert_eq!(d.next_frame(), Err(ProtocolError::UnknownType(200)));
+    }
+
+    #[test]
+    fn decode_oversized_length_errors_without_alloc() {
+        let mut d = FrameDecoder::new();
+        d.push(&[9, 0xFF, 0xFF, 0xFF, 0xFF]); // len ~4 GiB
+        assert_eq!(d.next_frame(), Err(ProtocolError::FrameTooLarge(u32::MAX)));
     }
 }
