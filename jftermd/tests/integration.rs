@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jftermd::protocol::{Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, SessionInfo};
+use jftermd::protocol::{
+    AttachOrOpen, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, SessionInfo,
+};
 use jftermd::registry::Registry;
 use jftermd::server::{ServerOpts, run};
 
@@ -111,4 +113,163 @@ async fn list_on_empty_daemon_returns_no_sessions() {
     let sessions: Vec<SessionInfo> = reply.json().unwrap();
     assert!(sessions.is_empty());
     assert!(h.registry.is_empty());
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+fn attach_or_open(id: &str, argv: Vec<String>, want_chunks: usize, cols: u16, rows: u16) -> Frame {
+    Frame::control(
+        FrameType::AttachOrOpen,
+        &AttachOrOpen {
+            session_id: id.into(),
+            cwd: "/".into(),
+            argv,
+            want_chunks,
+            cols,
+            rows,
+        },
+    )
+    .unwrap()
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+async fn recv_data_until(c: &mut Conn, needle: &[u8], timeout: Duration) -> Vec<u8> {
+    let mut acc = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return acc;
+        }
+        match c.recv(remaining).await {
+            Some(f) if f.ty == FrameType::Data => {
+                acc.extend_from_slice(&f.payload);
+                if contains(&acc, needle) {
+                    return acc;
+                }
+            }
+            Some(_) => {}
+            None => return acc,
+        }
+    }
+}
+
+async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn open_drains_then_reattach_replays_scrollback() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c1 = h.connect().await;
+    c1.send(&attach_or_open(
+        "s1",
+        argv(&["sh", "-c", "echo MARKER; exec cat"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    let got = recv_data_until(&mut c1, b"MARKER", Duration::from_secs(3)).await;
+    assert!(contains(&got, b"MARKER"), "first client missed live output");
+    drop(c1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut c2 = h.connect().await;
+    c2.send(&attach_or_open("s1", argv(&["true"]), 0, 80, 24))
+        .await;
+    let got = recv_data_until(&mut c2, b"MARKER", Duration::from_secs(3)).await;
+    assert!(
+        contains(&got, b"MARKER"),
+        "reattach did not replay scrollback"
+    );
+}
+
+#[tokio::test]
+async fn input_reaches_shell_and_output_returns() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c = h.connect().await;
+    c.send(&attach_or_open("s2", argv(&["cat"]), 0, 80, 24))
+        .await;
+    c.send(&Frame::new(FrameType::Input, b"PINGPONG\n".to_vec()))
+        .await;
+    let got = recv_data_until(&mut c, b"PINGPONG", Duration::from_secs(3)).await;
+    assert!(contains(&got, b"PINGPONG"));
+}
+
+#[tokio::test]
+async fn close_kills_and_drops_session() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c = h.connect().await;
+    c.send(&attach_or_open("s3", argv(&["cat"]), 0, 80, 24))
+        .await;
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
+    assert!(!h.registry.is_empty());
+    c.send(&Frame::new(FrameType::Close, Vec::new())).await;
+    wait_until(Duration::from_secs(3), || h.registry.is_empty()).await;
+    assert!(h.registry.is_empty(), "CLOSE should drop the session");
+}
+
+#[tokio::test]
+async fn socket_drop_detaches_but_keeps_shell_running() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c = h.connect().await;
+    c.send(&attach_or_open(
+        "s4",
+        argv(&["sh", "-c", "echo START; exec cat"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    let _ = recv_data_until(&mut c, b"START", Duration::from_secs(3)).await;
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!h.registry.is_empty(), "detach must not kill the shell");
+
+    let mut c2 = h.connect().await;
+    c2.send(&attach_or_open("s4", argv(&["true"]), 0, 80, 24))
+        .await;
+    let got = recv_data_until(&mut c2, b"START", Duration::from_secs(3)).await;
+    assert!(contains(&got, b"START"));
+}
+
+#[tokio::test]
+async fn second_attach_takes_over_and_kicks_first() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c1 = h.connect().await;
+    c1.send(&attach_or_open(
+        "s5",
+        argv(&["sh", "-c", "echo HI; exec cat"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    let _ = recv_data_until(&mut c1, b"HI", Duration::from_secs(3)).await;
+
+    let mut c2 = h.connect().await;
+    c2.send(&attach_or_open("s5", argv(&["true"]), 0, 80, 24))
+        .await;
+    let _ = recv_data_until(&mut c2, b"HI", Duration::from_secs(3)).await;
+
+    assert!(
+        c1.recv(Duration::from_secs(3)).await.is_none(),
+        "old client must be kicked on takeover"
+    );
+    c2.send(&Frame::new(FrameType::Input, b"AFTER\n".to_vec()))
+        .await;
+    let got = recv_data_until(&mut c2, b"AFTER", Duration::from_secs(3)).await;
+    assert!(contains(&got, b"AFTER"));
 }
