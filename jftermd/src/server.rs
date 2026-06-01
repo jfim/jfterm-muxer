@@ -3,7 +3,8 @@
 //!
 //! The actor and its helpers are currently driven only by the in-crate tests;
 //! the accept loop that wires them into a running daemon lands in a later task,
-//! so the public surface is allowed to be unused for now.
+//! so the public surface is allowed to be unused for now. TODO(Task 5): remove
+//! this module-wide allow once `handle_session` wires `actor_loop` in.
 #![allow(dead_code)]
 
 use std::os::fd::{AsRawFd, RawFd};
@@ -124,15 +125,9 @@ pub(crate) async fn actor_loop(
     registry: Arc<Registry>,
     opts: ServerOpts,
 ) {
-    // Ensure this session is present in the registry for the duration of the
-    // actor. In the production accept-loop the caller already inserted the
-    // handle via `attach_or_create` before spawning us, so this is an idempotent
-    // `Existing` no-op there; when the actor is driven directly (tests) it
-    // self-registers so presence/removal — including dead-session retention — is
-    // observable. The matching `registry.remove(&id)` on the way out closes the
-    // lifecycle either way.
-    let _ = registry.attach_or_create(&id);
-
+    // The caller (accept loop / tests) inserts the registry handle via
+    // `attach_or_create` before spawning us; the actor only ever `remove`s
+    // itself on the way out, so insert/remove ownership stays with the caller.
     let async_fd =
         match AsyncFd::with_interest(MasterFd(session.master_raw_fd()), Interest::READABLE) {
             Ok(fd) => fd,
@@ -236,7 +231,7 @@ pub(crate) async fn actor_loop(
 mod tests {
     use super::*;
     use crate::protocol::{Frame, FrameType};
-    use crate::registry::{AttachRequest, Registry, SessionCommand};
+    use crate::registry::{AttachRequest, Bind, Registry, SessionCommand};
     use crate::session::Session;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -288,7 +283,13 @@ mod tests {
         .unwrap()
         .expect("open");
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        // Register through the registry exactly as the production caller does:
+        // caller inserts via `attach_or_create`, keeps `cmd_tx`, hands `cmd_rx`
+        // to the actor. Makes dead-session retention observable on `reg`.
+        let (cmd_tx, cmd_rx) = match reg.attach_or_create("a1") {
+            Bind::Created { cmd_tx, cmd_rx } => (cmd_tx, cmd_rx),
+            Bind::Existing(_) => panic!("fresh id should be Created"),
+        };
         let task = tokio::spawn(actor_loop(
             session,
             "a1".into(),
@@ -339,7 +340,10 @@ mod tests {
         .await
         .unwrap()
         .expect("open");
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = match reg.attach_or_create("d1") {
+            Bind::Created { cmd_tx, cmd_rx } => (cmd_tx, cmd_rx),
+            Bind::Existing(_) => panic!("fresh id should be Created"),
+        };
         let task = tokio::spawn(actor_loop(session, "d1".into(), cmd_rx, reg.clone(), opts));
 
         tokio::time::sleep(Duration::from_millis(300)).await;
