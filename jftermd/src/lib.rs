@@ -5,3 +5,4 @@
 //! UDS server and daemonization land in B2.
 
 pub mod protocol;
+pub mod pty;
