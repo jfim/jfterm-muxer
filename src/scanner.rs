@@ -25,6 +25,10 @@ struct Sink {
     sticky: StickyState,
     status: StatusCache,
     event: SegEvent,
+    /// Set at the end of `osc_dispatch` to that OSC's classification, so a
+    /// directly-following ST terminator (`ESC \`) is classified the same way
+    /// instead of leaking a stray backslash (drop) or splitting the ST (keep).
+    st_pending: Option<SegEvent>,
 }
 
 impl Sink {
@@ -33,6 +37,7 @@ impl Sink {
             sticky: StickyState::new(),
             status: StatusCache::new(),
             event: SegEvent::None,
+            st_pending: None,
         }
     }
 
@@ -43,10 +48,12 @@ impl Sink {
 
 impl Perform for Sink {
     fn print(&mut self, _c: char) {
+        self.st_pending = None;
         self.event = SegEvent::KeepByte;
     }
 
     fn execute(&mut self, byte: u8) {
+        self.st_pending = None;
         // C0 controls. Keep the ones that affect layout; drop the bell.
         self.event = if byte == 0x07 {
             SegEvent::DropSeq
@@ -56,14 +63,17 @@ impl Perform for Sink {
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+        self.st_pending = None;
         self.event = SegEvent::None;
     }
 
     fn put(&mut self, _byte: u8) {
+        self.st_pending = None;
         self.event = SegEvent::None;
     }
 
     fn unhook(&mut self) {
+        self.st_pending = None;
         self.event = SegEvent::KeepSeq;
     }
 
@@ -111,9 +121,11 @@ impl Perform for Sink {
                 self.event = SegEvent::KeepSeq;
             }
         }
+        self.st_pending = Some(self.event.clone());
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.st_pending = None;
         let is_private = intermediates.first() == Some(&b'?');
         match action {
             'n' => {
@@ -122,7 +134,7 @@ impl Perform for Sink {
             'c' => {
                 self.event = SegEvent::DropSeq;
             }
-            'm' => {
+            'm' if !is_private => {
                 let mut flat = Vec::new();
                 for sub in params.iter() {
                     for v in sub {
@@ -175,6 +187,16 @@ impl Perform for Sink {
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        // ST terminator (`\`) closing an OSC: mirror that OSC's classification
+        // so a dropped OSC drops its `\` and a kept OSC keeps the full `ESC \`.
+        if byte == b'\\'
+            && let Some(ev) = self.st_pending.take()
+        {
+            self.event = ev;
+            return;
+        }
+        self.st_pending = None;
+        // ESC c = RIS (full reset) -> treat as a clear/purge base.
         self.event = if byte == b'c' {
             SegEvent::ClearSeq
         } else {
@@ -338,6 +360,26 @@ mod tests {
         let out = s.replay(usize::MAX);
         assert!(!out.windows(3).any(|w| w == b"old"));
         assert!(out.ends_with(b"new"));
+    }
+
+    #[test]
+    fn st_terminated_clipboard_is_fully_dropped() {
+        // OSC 52 closed by ST (ESC \) — no stray backslash may leak.
+        let s = feed(b"A\x1b]52;c;aGVsbG8=\x1b\\B");
+        assert_eq!(s.replay(usize::MAX), b"AB".to_vec());
+    }
+
+    #[test]
+    fn st_terminated_notification_is_fully_dropped() {
+        let s = feed(b"A\x1b]9;done\x1b\\B");
+        assert_eq!(s.replay(usize::MAX), b"AB".to_vec());
+    }
+
+    #[test]
+    fn st_terminated_title_is_kept_intact() {
+        // Kept OSC keeps the full ST terminator (ESC \), no dangling ESC.
+        let s = feed(b"\x1b]2;vim\x1b\\X");
+        assert_eq!(s.replay(usize::MAX), b"\x1b]2;vim\x1b\\X".to_vec());
     }
 
     #[test]
