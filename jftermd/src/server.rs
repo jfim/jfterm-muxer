@@ -540,6 +540,25 @@ async fn writer_task(mut out_rx: mpsc::Receiver<Frame>, mut wh: OwnedWriteHalf) 
     let _ = wh.shutdown().await;
 }
 
+/// Resolve when the daemon should self-exit: after the first session has
+/// existed and the registry has then stayed empty for `grace`. A
+/// freshly-started (never-populated) registry never resolves.
+pub async fn wait_until_idle(registry: Arc<Registry>, grace: Duration) {
+    while registry.is_empty() {
+        registry.wait_for_change().await;
+    }
+    loop {
+        if registry.is_empty() {
+            tokio::time::sleep(grace).await;
+            // Re-check authoritatively: a session may have appeared during the grace.
+            if registry.is_empty() {
+                return;
+            }
+        }
+        registry.wait_for_change().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +715,39 @@ mod tests {
             .expect("actor should end after dead reattach")
             .unwrap();
         assert!(reg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_waits_for_first_session_then_resolves_when_empty() {
+        let reg = Registry::new();
+        let watcher = tokio::spawn(wait_until_idle(reg.clone(), Duration::from_millis(50)));
+        // Empty at start: must NOT resolve (a freshly-spawned daemon stays up).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !watcher.is_finished(),
+            "must not exit before any session exists"
+        );
+        // A session appears, then ends -> watcher resolves after the grace.
+        let _keep = reg.attach_or_create("s1");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reg.remove("s1");
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("watcher should resolve once idle")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_watcher_does_not_resolve_while_a_session_lives() {
+        let reg = Registry::new();
+        let _keep = reg.attach_or_create("s1");
+        let watcher = tokio::spawn(wait_until_idle(reg.clone(), Duration::from_millis(50)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!watcher.is_finished(), "must stay up while a session lives");
+        reg.remove("s1");
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("resolves after removal")
+            .unwrap();
     }
 }

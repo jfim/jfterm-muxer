@@ -81,6 +81,7 @@ impl Registry {
                 cmd_tx: cmd_tx.clone(),
             },
         );
+        self.ended.notify_one();
         Bind::Created { cmd_tx, cmd_rx }
     }
 
