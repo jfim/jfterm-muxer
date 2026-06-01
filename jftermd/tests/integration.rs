@@ -378,3 +378,58 @@ async fn shell_exit_while_detached_retains_dead_session_then_replays_exit() {
         "dead session dropped after reattach replay"
     );
 }
+
+#[tokio::test]
+async fn binary_foreground_serves_a_session_then_self_exits_when_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("muxer.sock");
+    let bin = env!("CARGO_BIN_EXE_jftermd");
+
+    let mut child = std::process::Command::new(bin)
+        .arg("--foreground")
+        .arg("--socket")
+        .arg(&sock)
+        .spawn()
+        .expect("spawn jftermd");
+
+    // Wait for the socket to appear.
+    wait_until(Duration::from_secs(5), || sock.exists()).await;
+
+    let mut c = Conn {
+        stream: UnixStream::connect(&sock).await.expect("connect"),
+        dec: FrameDecoder::new(),
+    };
+    c.send(&attach_or_open(
+        "smoke",
+        argv(&["sh", "-c", "echo SMOKED; exec cat"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    let got = recv_data_until(&mut c, b"SMOKED", Duration::from_secs(5)).await;
+    assert!(
+        contains(&got, b"SMOKED"),
+        "binary did not serve session output"
+    );
+
+    c.send(&Frame::new(FrameType::Close, Vec::new())).await;
+    drop(c);
+
+    // Idle after the last session ends -> the daemon self-exits within exit_grace.
+    let mut exited = None;
+    for _ in 0..150 {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            exited = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    match exited {
+        Some(status) => assert!(status.success(), "daemon exited non-zero: {status:?}"),
+        None => {
+            let _ = child.kill();
+            panic!("daemon did not self-exit when idle");
+        }
+    }
+}
