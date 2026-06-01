@@ -300,18 +300,29 @@ pub(crate) async fn actor_loop(
                         let _ = reply.send(session.info(client.is_some()));
                     }
                     Some(SessionCommand::Close) => {
-                        session = tokio::task::spawn_blocking(move || {
+                        // close() blocks (SIGHUP + bounded reap spin); run it off
+                        // the loop. If the blocking task panics the session is
+                        // lost, but we still fall through to break -> the
+                        // `registry.remove` below cleans up the handle so a panic
+                        // can never leak a session id.
+                        match tokio::task::spawn_blocking(move || {
                             let _ = session.close();
                             session
                         })
                         .await
-                        .expect("close task panicked");
-                        let code = match session.lifecycle() {
-                            Lifecycle::Dead { status } => status,
-                            Lifecycle::Live => 0,
-                        };
-                        if let Some(tx) = client.take() {
-                            let _ = tx.try_send(exit_frame(code));
+                        {
+                            Ok(closed) => {
+                                let code = match closed.lifecycle() {
+                                    Lifecycle::Dead { status } => status,
+                                    Lifecycle::Live => 0,
+                                };
+                                if let Some(tx) = client.take() {
+                                    let _ = tx.try_send(exit_frame(code));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%id, error = %e, "close task panicked");
+                            }
                         }
                         break;
                     }
