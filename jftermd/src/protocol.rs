@@ -3,6 +3,8 @@
 //! Hot frames (`Data`/`Input`) carry raw terminal bytes; control frames carry
 //! a small JSON value. Pure and I/O-free — the socket layer (B2) owns transport.
 
+use serde::{Deserialize, Serialize};
+
 /// Protocol version carried in `Hello`; a mismatch is rejected by the server.
 pub const PROTO_VERSION: u32 = 1;
 
@@ -132,6 +134,68 @@ impl FrameDecoder {
     }
 }
 
+/// `Hello` / `HelloOk` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub proto_version: u32,
+    pub daemon_version: String,
+}
+
+/// One entry in the `Sessions` reply to `List`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub running: bool,
+    pub has_client: bool,
+    pub created_at: u64,
+}
+
+/// `AttachOrOpen` value — binds a session connection; opens if unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachOrOpen {
+    pub session_id: String,
+    pub cwd: String,
+    pub argv: Vec<String>,
+    /// `0` = full available scrollback (last purge boundary); else cap.
+    pub want_chunks: usize,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// `Resize` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// `Status` value — semantic dot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusMsg {
+    pub running: bool,
+    pub progress: Option<u8>,
+}
+
+/// `Exit` value — shell child exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitMsg {
+    pub status: i32,
+}
+
+impl Frame {
+    /// Build a control frame whose value is the JSON encoding of `value`.
+    pub fn control<T: Serialize>(ty: FrameType, value: &T) -> serde_json::Result<Self> {
+        Ok(Self::new(ty, serde_json::to_vec(value)?))
+    }
+
+    /// Decode this frame's value as JSON into `T`.
+    pub fn json<T: for<'de> Deserialize<'de>>(&self) -> serde_json::Result<T> {
+        serde_json::from_slice(&self.payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +258,45 @@ mod tests {
         let mut d = FrameDecoder::new();
         d.push(&[9, 0xFF, 0xFF, 0xFF, 0xFF]); // len ~4 GiB
         assert_eq!(d.next_frame(), Err(ProtocolError::FrameTooLarge(u32::MAX)));
+    }
+
+    #[test]
+    fn attach_or_open_round_trips_through_a_frame() {
+        let msg = AttachOrOpen {
+            session_id: "tab-1".into(),
+            cwd: "/home/u".into(),
+            argv: vec!["bash".into(), "-l".into()],
+            want_chunks: 0,
+            cols: 80,
+            rows: 24,
+        };
+        let frame = Frame::control(FrameType::AttachOrOpen, &msg).unwrap();
+        assert_eq!(frame.ty, FrameType::AttachOrOpen);
+        let back: AttachOrOpen = frame.json().unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn status_round_trips_both_progress_states() {
+        for progress in [None, Some(0u8), Some(75u8), Some(100u8)] {
+            let msg = StatusMsg {
+                running: true,
+                progress,
+            };
+            let frame = Frame::control(FrameType::Status, &msg).unwrap();
+            let back: StatusMsg = frame.json().unwrap();
+            assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
+    fn hello_round_trips() {
+        let msg = Hello {
+            proto_version: PROTO_VERSION,
+            daemon_version: "0.1.0".into(),
+        };
+        let frame = Frame::control(FrameType::Hello, &msg).unwrap();
+        let back: Hello = frame.json().unwrap();
+        assert_eq!(back, msg);
     }
 }
