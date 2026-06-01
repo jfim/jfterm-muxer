@@ -7,17 +7,23 @@
 //! this module-wide allow once `handle_session` wires `actor_loop` in.
 #![allow(dead_code)]
 
+use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
 use jftermd_core::StatusSnapshot;
-use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
-use crate::protocol::{ExitMsg, Frame, FrameType, StatusMsg, frame_data};
+use crate::protocol::{
+    ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, ProtocolError, SessionInfo,
+    StatusMsg, frame_data,
+};
 use crate::registry::{AttachRequest, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
 
@@ -113,6 +119,139 @@ fn attach_client(
     // Replacing the Option drops the previous out_tx -> old writer task ends ->
     // old client socket closes (takeover detach).
     *client = Some(req.out_tx);
+}
+
+fn proto_io(e: ProtocolError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+fn json_io(e: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// Read frames off `rh` until one whole frame is available, or EOF (`None`).
+async fn read_one_frame(
+    rh: &mut OwnedReadHalf,
+    dec: &mut FrameDecoder,
+) -> io::Result<Option<Frame>> {
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(f) = dec.next_frame().map_err(proto_io)? {
+            return Ok(Some(f));
+        }
+        let n = rh.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        dec.push(&buf[..n]);
+    }
+}
+
+/// Accept connections forever, one task per connection.
+pub async fn run(listener: UnixListener, registry: Arc<Registry>, opts: ServerOpts) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let reg = registry.clone();
+                let opts = opts.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = dispatch_connection(stream, reg, opts).await {
+                        tracing::debug!(error = %e, "connection ended");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Classify a connection by its first frame.
+async fn dispatch_connection(
+    stream: UnixStream,
+    registry: Arc<Registry>,
+    _opts: ServerOpts,
+) -> io::Result<()> {
+    let (mut rh, wh) = stream.into_split();
+    let mut dec = FrameDecoder::new();
+    let first = match read_one_frame(&mut rh, &mut dec).await? {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+    match first.ty {
+        FrameType::Hello => handle_control(first, rh, wh, registry, dec).await,
+        FrameType::AttachOrOpen => {
+            // Session binding lands in Task 5; until then, close politely.
+            tracing::warn!("session binding not yet implemented");
+            Ok(())
+        }
+        other => {
+            tracing::warn!(?other, "unexpected first frame; closing");
+            Ok(())
+        }
+    }
+}
+
+/// Control connection: HELLO_OK handshake, then LIST -> SESSIONS.
+async fn handle_control(
+    hello_frame: Frame,
+    mut rh: OwnedReadHalf,
+    mut wh: OwnedWriteHalf,
+    registry: Arc<Registry>,
+    mut dec: FrameDecoder,
+) -> io::Result<()> {
+    let hello: Hello = hello_frame.json().map_err(json_io)?;
+    if hello.proto_version != PROTO_VERSION {
+        tracing::warn!(
+            got = hello.proto_version,
+            want = PROTO_VERSION,
+            "proto mismatch; rejecting"
+        );
+        return Ok(());
+    }
+    let ok = Frame::control(
+        FrameType::HelloOk,
+        &Hello {
+            proto_version: PROTO_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    )
+    .map_err(json_io)?;
+    wh.write_all(&ok.encode()).await?;
+
+    loop {
+        let frame = match read_one_frame(&mut rh, &mut dec).await? {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        match frame.ty {
+            FrameType::List => {
+                let sessions = collect_sessions(&registry).await;
+                let reply = Frame::control(FrameType::Sessions, &sessions).map_err(json_io)?;
+                wh.write_all(&reply.encode()).await?;
+            }
+            other => {
+                tracing::warn!(?other, "unexpected control frame; ignoring");
+            }
+        }
+    }
+}
+
+/// Ask every live session actor for its `SessionInfo` (bounded by a timeout).
+async fn collect_sessions(registry: &Registry) -> Vec<SessionInfo> {
+    let handles = registry.handles();
+    let mut out = Vec::with_capacity(handles.len());
+    for (_id, tx) in handles {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send(SessionCommand::Info(reply_tx)).await.is_ok()
+            && let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(1), reply_rx).await
+        {
+            out.push(info);
+        }
+    }
+    out
 }
 
 /// The per-session actor: owns the `Session`, drains the PTY, and forwards
