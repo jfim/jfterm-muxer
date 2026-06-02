@@ -100,7 +100,13 @@ impl Session {
         }
         let mut exit = None;
         if drained.eof && !self.is_dead() {
-            let status = self.pty.try_reap()?.unwrap_or(0);
+            // EOF means the shell child is terminating; spin the reap until a
+            // terminal WaitStatus is observed so the real exit code is reported
+            // rather than fabricating 0 from a transient StillAlive/ECHILD.
+            // `None` only when the child was already reaped elsewhere (e.g. the
+            // Pty Drop reaper raced this path); we surface 0 in that single
+            // genuinely-unrecoverable case rather than blocking forever.
+            let status = self.pty.reap_blocking()?.unwrap_or(0);
             self.lifecycle = Lifecycle::Dead { status };
             exit = Some(status);
         }

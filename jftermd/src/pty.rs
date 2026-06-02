@@ -217,15 +217,48 @@ impl Pty {
     }
 
     /// Non-blocking reap. `Some(status)` once reaped (128+sig for signals),
-    /// `None` while still running.
+    /// `None` while still running OR if the status is not yet observable.
+    ///
+    /// Does NOT fabricate an exit code: a non-terminal `WaitStatus`
+    /// (`StillAlive`/`Stopped`/`Continued`) and a transient `ECHILD` both map
+    /// to `None` so the caller can retry until a real terminal status is seen,
+    /// rather than coercing a lost code to 0.
     pub fn try_reap(&self) -> io::Result<Option<i32>> {
         match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, code)) => Ok(Some(code)),
             Ok(WaitStatus::Signaled(_, sig, _)) => Ok(Some(128 + sig as i32)),
             Ok(_) => Ok(None),
-            Err(nix::errno::Errno::ECHILD) => Ok(Some(0)), // already reaped
+            // No child to wait for yet (e.g. status not reapable this instant);
+            // do not invent a 0 — let the caller spin for the real status.
+            Err(nix::errno::Errno::ECHILD) => Ok(None),
             Err(e) => Err(io_err(e)),
         }
+    }
+
+    /// Blocking reap that spins until a terminal `WaitStatus` is observed,
+    /// returning the true exit code (128+sig for signals). Used at EOF, where
+    /// the child is known to be terminating, so the real code is never lost to
+    /// a transient non-terminal wait result. Bounded so a wedged reap cannot
+    /// hang the actor forever; returns `None` only if no terminal status is
+    /// observable within the bound (child already reaped elsewhere).
+    pub fn reap_blocking(&self) -> io::Result<Option<i32>> {
+        // ~1s worst case (200 * 5ms): the child has already closed its PTY
+        // slave (that is what produced EOF), so the kernel transition to a
+        // terminal wait state is imminent and this spins only a few times.
+        for _ in 0..200 {
+            match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => return Ok(Some(code)),
+                Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(Some(128 + sig as i32)),
+                // Not yet terminal (StillAlive/Stopped/Continued): keep waiting
+                // for the real code instead of coercing to 0.
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                // Already reaped elsewhere: the real code is genuinely
+                // unrecoverable, but we still must not fabricate one.
+                Err(nix::errno::Errno::ECHILD) => return Ok(None),
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        Ok(None)
     }
 }
 
