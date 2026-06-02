@@ -488,7 +488,10 @@ async fn shell_exit_while_detached_retains_dead_session_then_replays_exit() {
 #[tokio::test]
 async fn binary_foreground_serves_a_session_then_self_exits_when_idle() {
     let tmp = tempfile::tempdir().unwrap();
-    let sock = tmp.path().join("muxer.sock");
+    // Point the socket into a subdir that jftermd creates itself at 0700, so the
+    // hardened ensure_socket_dir (real-dir + owner + 0700 check) is satisfied;
+    // the tempdir root's own mode depends on the harness umask.
+    let sock = tmp.path().join("jfterm").join("muxer.sock");
     let bin = env!("CARGO_BIN_EXE_jftermd");
 
     let mut child = std::process::Command::new(bin)
