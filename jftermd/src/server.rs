@@ -20,7 +20,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::protocol::{
     AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
-    ProtocolError, Resize, SessionInfo, StatusMsg, frame_data,
+    Resize, SessionInfo, StatusMsg, frame_data,
 };
 use crate::registry::{AttachRequest, Bind, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
@@ -125,14 +125,6 @@ fn attach_client(
     *client = Some(req.out_tx);
 }
 
-fn proto_io(e: ProtocolError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
-}
-
-fn json_io(e: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e)
-}
-
 /// Read frames off `rh` until one whole frame is available, or EOF (`None`).
 async fn read_one_frame(
     rh: &mut OwnedReadHalf,
@@ -140,7 +132,7 @@ async fn read_one_frame(
 ) -> io::Result<Option<Frame>> {
     let mut buf = [0u8; 4096];
     loop {
-        if let Some(f) = dec.next_frame().map_err(proto_io)? {
+        if let Some(f) = dec.next_frame()? {
             return Ok(Some(f));
         }
         let n = rh.read(&mut buf).await?;
@@ -202,7 +194,7 @@ async fn handle_control(
     registry: Arc<Registry>,
     mut dec: FrameDecoder,
 ) -> io::Result<()> {
-    let hello: Hello = hello_frame.json().map_err(json_io)?;
+    let hello: Hello = hello_frame.json()?;
     if hello.proto_version != PROTO_VERSION {
         tracing::warn!(
             got = hello.proto_version,
@@ -217,8 +209,7 @@ async fn handle_control(
             proto_version: PROTO_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         },
-    )
-    .map_err(json_io)?;
+    )?;
     wh.write_all(&ok.encode()).await?;
 
     loop {
@@ -229,7 +220,7 @@ async fn handle_control(
         match frame.ty {
             FrameType::List => {
                 let sessions = collect_sessions(&registry).await;
-                let reply = Frame::control(FrameType::Sessions, &sessions).map_err(json_io)?;
+                let reply = Frame::control(FrameType::Sessions, &sessions)?;
                 wh.write_all(&reply.encode()).await?;
             }
             other => {
@@ -486,7 +477,7 @@ async fn handle_session(
     dec: FrameDecoder,
     opts: ServerOpts,
 ) -> io::Result<()> {
-    let req: AttachOrOpen = first.json().map_err(json_io)?;
+    let req: AttachOrOpen = first.json()?;
     let cmd_tx = match registry.attach_or_create(&req.session_id) {
         Bind::Existing(tx) => tx,
         Bind::Created { cmd_tx, cmd_rx } => {

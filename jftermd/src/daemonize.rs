@@ -9,10 +9,6 @@ use std::path::Path;
 
 use nix::fcntl::{Flock, FlockArg};
 
-fn errno_io(e: nix::errno::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e as i32)
-}
-
 /// Outcome of trying to become the daemon.
 // `main.rs` (Task 9) consumes `lock`/`listener`; until then only tests read
 // them via `matches!`, so allow dead_code here rather than dropping the fields.
@@ -44,7 +40,7 @@ fn try_flock(lock_path: &Path) -> io::Result<Option<Flock<File>>> {
         Ok(flock) => Ok(Some(flock)),
         // EWOULDBLOCK == EAGAIN on Linux; matching one covers both.
         Err((_f, nix::errno::Errno::EAGAIN)) => Ok(None),
-        Err((_f, e)) => Err(errno_io(e)),
+        Err((_f, e)) => Err(e.into()),
     }
 }
 
@@ -98,7 +94,7 @@ fn unlink_stale_socket(sock_path: &Path) -> io::Result<()> {
 /// Set FD_CLOEXEC on a file descriptor so it is not inherited across exec.
 fn set_cloexec<F: std::os::fd::AsFd>(fd: &F) -> io::Result<()> {
     use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(errno_io)?;
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
     Ok(())
 }
 
@@ -119,16 +115,16 @@ pub fn daemonize() -> io::Result<()> {
 
     // SAFETY: between fork and the next exec/_exit we touch only
     // async-signal-safe calls; the parent simply exits.
-    match unsafe { fork() }.map_err(errno_io)? {
+    match unsafe { fork() }? {
         ForkResult::Parent { .. } => std::process::exit(0),
         ForkResult::Child => {}
     }
-    setsid().map_err(errno_io)?;
-    match unsafe { fork() }.map_err(errno_io)? {
+    setsid()?;
+    match unsafe { fork() }? {
         ForkResult::Parent { .. } => std::process::exit(0),
         ForkResult::Child => {}
     }
-    chdir("/").map_err(errno_io)?;
+    chdir("/")?;
     redirect_std_to_devnull()?;
     Ok(())
 }
