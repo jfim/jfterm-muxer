@@ -245,11 +245,20 @@ impl Scanner {
             // it is also a legal UTF-8 continuation byte. Only a *standalone*
             // 0x9C (not part of a multibyte character) is a C1 ST.
             if self.utf8_remaining > 0 {
-                // Continuation byte of a multibyte character: pass through
-                // verbatim so 0x9C inside e.g. ✓ (E2 9C 93) is not mangled.
-                self.utf8_remaining -= 1;
-                self.advance_one(b);
-                continue;
+                if (0x80..=0xBF).contains(&b) {
+                    // Genuine continuation byte of a multibyte character: pass
+                    // through verbatim so 0x9C inside e.g. ✓ (E2 9C 93) is not
+                    // mangled.
+                    self.utf8_remaining -= 1;
+                    self.advance_one(b);
+                    continue;
+                }
+                // Malformed UTF-8: a non-continuation byte arrived mid-sequence.
+                // Resynchronize by abandoning the partial sequence (reset the
+                // counter to 0) and reprocessing this byte as a fresh ground
+                // byte below — so a standalone 0x9C here is still recognized as
+                // the C1 ST, and a new UTF-8 lead starts a new sequence.
+                self.utf8_remaining = 0;
             }
             // Ground byte: note any UTF-8 lead so the following continuation
             // bytes are passed through verbatim above.
