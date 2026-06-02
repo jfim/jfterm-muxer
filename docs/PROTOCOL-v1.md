@@ -49,13 +49,49 @@ Every message is exactly one frame:
 
 The 5-byte header is fixed. `length` **must not exceed `16 * 1024 * 1024`
 (16 MiB)**; a frame declaring a larger length is a protocol violation and the
-daemon closes the connection. The daemon splits large output across multiple
-`DATA` frames so a single frame never exceeds this cap — the client must be
-prepared to receive output as a sequence of `DATA` frames and concatenate them.
+receiver closes the connection. The high bits of `length` are therefore always
+zero today (16 MiB is `0x0100_0000`); there is **no continuation/“more” flag** in
+the length field — see "Payloads larger than the cap" below for why one isn't
+needed.
 
-A reader must handle a frame split across multiple socket reads, and multiple
-frames arriving in one read. Accumulate bytes; a frame is complete once you have
-`5 + length` bytes.
+### Reading frames (the framing mechanism)
+
+A frame's bytes may arrive across several `read()`s, and one `read()` may deliver
+several frames (or a frame and a half). So a reader buffers incoming bytes and
+extracts frames with a fixed loop:
+
+1. If the buffer holds fewer than 5 bytes, wait for more.
+2. Parse `type` (byte 0) and `length` (bytes 1–4, big-endian). If `length`
+   exceeds 16 MiB, the stream is malformed — close the connection.
+3. If the buffer holds fewer than `5 + length` bytes, wait for more.
+4. Otherwise, a complete frame is `buffer[0 .. 5 + length]`; remove those bytes
+   and dispatch it. Repeat from step 1 (more frames may already be buffered).
+
+This is the entire framing contract. A reader **never reassembles a payload across
+multiple frames** — each frame is processed on its own as soon as it completes.
+
+### Payloads larger than the cap
+
+There is no per-frame continuation flag because the only payloads that can grow
+large are **byte streams**, where frame boundaries carry no meaning:
+
+- **`DATA` (output) and `INPUT` (keystrokes/paste) are streams.** When output
+  exceeds the cap, the daemon simply emits it as **several consecutive `DATA`
+  frames**; the client concatenates their values in arrival order and feeds them to
+  the terminal (VTE), which reassembles any escape sequence split across a frame
+  boundary. Splitting at an arbitrary byte offset is lossless and invisible to the
+  consumer — multiple `DATA` frames *are* the continuation, implicitly. The same
+  applies to a large `INPUT`: send it as multiple `INPUT` frames; the daemon writes
+  each to the PTY in order. Neither side allocates a reassembly buffer, so the
+  16 MiB cap stays a hard per-read bound (no unbounded-growth path).
+- **Control (JSON) frames are atomic and small.** A JSON document must arrive in a
+  single frame (you can't parse half of one), but the largest control message,
+  `SESSIONS`, is on the order of a couple hundred bytes per session — orders of
+  magnitude under the cap. Control frames are never split.
+
+(If some future *atomic* payload ever needed to exceed the cap, the always-zero top
+bit of `length` could be claimed as a continuation flag in a later `proto_version`,
+paired with a total-reassembled-size cap. v1 does not need it.)
 
 ### Byte-layout examples
 
