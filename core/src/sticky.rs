@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 /// Visual terminal state that must be re-asserted to make a chunk
@@ -16,6 +17,10 @@ pub struct StickyState {
     cwd: Option<Vec<u8>>,
     /// Last OSC 0/2 title payload, opaque bytes.
     title: Option<Vec<u8>>,
+    /// Cached serialized prologue, rebuilt lazily and invalidated on any
+    /// state mutation. Avoids rebuilding the prologue (with per-param
+    /// `to_string`) on every cut/purge when the state has not changed.
+    cache: RefCell<Option<Vec<u8>>>,
 }
 
 impl StickyState {
@@ -23,9 +28,15 @@ impl StickyState {
         Self::default()
     }
 
+    /// Drop the cached prologue; called after any state mutation.
+    fn invalidate(&mut self) {
+        *self.cache.get_mut() = None;
+    }
+
     pub fn set_sgr(&mut self, params: &[u16]) {
         self.sgr.clear();
         self.sgr.extend_from_slice(params);
+        self.invalidate();
     }
 
     pub fn set_dec_mode(&mut self, code: u16, on: bool) {
@@ -34,23 +45,38 @@ impl StickyState {
         } else {
             self.dec_modes.remove(&code);
         }
+        self.invalidate();
     }
 
     pub fn set_scroll_region(&mut self, region: Option<(u16, u16)>) {
         self.scroll_region = region;
+        self.invalidate();
     }
 
     pub fn set_cwd(&mut self, cwd: Option<Vec<u8>>) {
         self.cwd = cwd;
+        self.invalidate();
     }
 
     pub fn set_title(&mut self, title: Option<Vec<u8>>) {
         self.title = title;
+        self.invalidate();
     }
 
     /// Emit a byte string that re-establishes this state from a cold terminal.
     /// Always begins with a full SGR reset so the chunk is self-contained.
+    /// The result is cached and reused until the next state mutation.
     pub fn serialize(&self) -> Vec<u8> {
+        if let Some(cached) = self.cache.borrow().as_ref() {
+            return cached.clone();
+        }
+        let out = self.build_serialized();
+        *self.cache.borrow_mut() = Some(out.clone());
+        out
+    }
+
+    /// Build the prologue bytes from scratch (uncached).
+    fn build_serialized(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1b[0m");
 
