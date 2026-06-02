@@ -229,6 +229,19 @@ impl Pty {
     }
 }
 
+impl Drop for Pty {
+    /// Best-effort kill/reap on drop. Kill/reap policy: SIGKILL the child's
+    /// process group, then `waitpid` (blocking, but the group was just killed)
+    /// to clear the zombie. All errors are ignored — the child may already be
+    /// reaped (ECHILD) or gone (ESRCH); dropping must never panic or block
+    /// indefinitely. This guarantees no orphaned shell process group is left
+    /// behind when a `Pty` (and its owning `Session`) is dropped on any path.
+    fn drop(&mut self) {
+        let _ = killpg(self.child, Signal::SIGKILL);
+        let _ = waitpid(self.child, None);
+    }
+}
+
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io_err)?;
     Ok(())
