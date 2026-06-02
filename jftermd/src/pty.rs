@@ -63,12 +63,15 @@ impl Pty {
         if argv_c.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
         }
+        // Force the emulator-capability vars; drop any inherited values so they
+        // can't override what JFTerm's terminal actually supports.
         let mut env_c: Vec<CString> = std::env::vars()
-            .filter(|(k, _)| k != "TERM")
+            .filter(|(k, _)| k != "TERM" && k != "COLORTERM")
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         env_c.push(CString::new("TERM=xterm-256color").unwrap());
+        env_c.push(CString::new("COLORTERM=truecolor").unwrap());
         let cwd_c = CString::new(cwd.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -240,6 +243,22 @@ mod tests {
         assert!(
             out.windows(14).any(|w| w == b"xterm-256color"),
             "TERM not set; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn echoes_colorterm_truecolor() {
+        let mut pty = Pty::spawn(
+            &argv(&["sh", "-c", "printf %s \"$COLORTERM\""]),
+            Path::new("/"),
+            winsize(80, 24),
+        )
+        .expect("spawn");
+        let out = read_until(&mut pty, b"truecolor", Duration::from_secs(3));
+        assert!(
+            out.windows(9).any(|w| w == b"truecolor"),
+            "COLORTERM not set; got {:?}",
             String::from_utf8_lossy(&out)
         );
     }
