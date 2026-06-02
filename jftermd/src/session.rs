@@ -163,30 +163,6 @@ impl Session {
         self.pty.kill()
     }
 
-    /// Kill the shell (SIGHUP), reap, and mark dead. Idempotent.
-    pub fn close(&mut self) -> io::Result<i32> {
-        if let Lifecycle::Dead { status } = self.lifecycle {
-            return Ok(status);
-        }
-        self.pty.hangup()?;
-        // Drain any final output into the engine before reaping.
-        if let Ok(final_out) = self.pty.drain()
-            && !final_out.bytes.is_empty()
-        {
-            self.engine.feed(&final_out.bytes);
-        }
-        let mut status = 0;
-        for _ in 0..200 {
-            if let Some(s) = self.pty.try_reap()? {
-                status = s;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        self.lifecycle = Lifecycle::Dead { status };
-        Ok(status)
-    }
-
     /// Snapshot for the `List`/`Sessions` control reply.
     pub fn info(&self, has_client: bool) -> SessionInfo {
         SessionInfo {
@@ -284,40 +260,5 @@ mod tests {
         assert_eq!(info.cwd, "/home");
         assert!(info.running);
         assert!(info.has_client);
-    }
-
-    #[test]
-    fn close_feeds_final_output_into_replay() {
-        // Shell prints a line then waits on stdin; close() must capture that
-        // final output into the replay even though we never drained it live.
-        let mut s = Session::open(
-            "tclose",
-            argv(&["sh", "-c", "echo final-banner; exec cat"]),
-            "/",
-            80,
-            24,
-        )
-        .expect("open");
-        // Give the shell a moment to emit the banner (do NOT drain it here).
-        std::thread::sleep(Duration::from_millis(200));
-        s.close().expect("close");
-        let replay = s.replay_for_attach(0);
-        assert!(
-            replay.data.windows(12).any(|w| w == b"final-banner"),
-            "close() did not feed final output into replay; got {:?}",
-            String::from_utf8_lossy(&replay.data)
-        );
-    }
-
-    #[test]
-    fn close_kills_and_reaps() {
-        let mut s = Session::open("t5", argv(&["cat"]), "/", 80, 24).expect("open");
-        let status = s.close().expect("close");
-        assert!(s.is_dead());
-        // SIGHUP-terminated `cat` reaps as 128+1 (SIGHUP) or 0 if it raced.
-        assert!(
-            status == 129 || status == 0,
-            "unexpected close status {status}"
-        );
     }
 }
