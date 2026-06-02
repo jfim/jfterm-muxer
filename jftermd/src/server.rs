@@ -258,13 +258,21 @@ async fn collect_sessions(registry: &Registry) -> Vec<SessionInfo> {
     out
 }
 
+/// Inputs to `merge_running`, named so the three booleans can't be transposed
+/// at the call site.
+struct RunningInputs {
+    has_marking: bool,
+    engine_running: bool,
+    poll_running: bool,
+}
+
 /// Effective `running`: the engine's value once the shell has shown OSC 133
 /// prompt marking, otherwise the tcgetpgrp poll value.
-fn merge_running(has_marking: bool, engine_running: bool, poll_running: bool) -> bool {
-    if has_marking {
-        engine_running
+fn merge_running(inputs: RunningInputs) -> bool {
+    if inputs.has_marking {
+        inputs.engine_running
     } else {
-        poll_running
+        inputs.poll_running
     }
 }
 
@@ -273,7 +281,11 @@ fn merge_running(has_marking: bool, engine_running: bool, poll_running: bool) ->
 fn effective_status(session: &Session, poll_running: bool) -> StatusSnapshot {
     let snap = session.status();
     StatusSnapshot {
-        running: merge_running(session.has_prompt_marking(), snap.running, poll_running),
+        running: merge_running(RunningInputs {
+            has_marking: session.has_prompt_marking(),
+            engine_running: snap.running,
+            poll_running,
+        }),
         progress: snap.progress,
     }
 }
@@ -685,10 +697,29 @@ mod tests {
 
     #[test]
     fn merge_running_prefers_engine_when_marked_else_poll() {
-        assert!(super::merge_running(true, true, false)); // marked -> engine
-        assert!(!super::merge_running(true, false, true)); // marked -> engine
-        assert!(super::merge_running(false, false, true)); // unmarked -> poll
-        assert!(!super::merge_running(false, true, false)); // unmarked -> poll
+        use super::RunningInputs;
+        // marked -> engine
+        assert!(super::merge_running(RunningInputs {
+            has_marking: true,
+            engine_running: true,
+            poll_running: false,
+        }));
+        assert!(!super::merge_running(RunningInputs {
+            has_marking: true,
+            engine_running: false,
+            poll_running: true,
+        }));
+        // unmarked -> poll
+        assert!(super::merge_running(RunningInputs {
+            has_marking: false,
+            engine_running: false,
+            poll_running: true,
+        }));
+        assert!(!super::merge_running(RunningInputs {
+            has_marking: false,
+            engine_running: true,
+            poll_running: false,
+        }));
     }
 
     #[tokio::test]
