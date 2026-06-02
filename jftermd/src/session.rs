@@ -147,6 +147,19 @@ impl Session {
         self.engine.status()
     }
 
+    /// `running` fallback via tcgetpgrp (false once dead).
+    pub fn poll_running(&self) -> bool {
+        if self.is_dead() {
+            return false;
+        }
+        self.pty.foreground_busy().unwrap_or(false)
+    }
+
+    /// Whether the shell uses OSC 133 prompt marking (engine latch).
+    pub fn has_prompt_marking(&self) -> bool {
+        self.engine.has_prompt_marking()
+    }
+
     /// SIGHUP the shell's process group (no-op once dead).
     pub fn hangup(&self) -> io::Result<()> {
         if self.is_dead() {

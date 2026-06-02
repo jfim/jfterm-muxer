@@ -34,6 +34,8 @@ pub struct ServerOpts {
     pub exit_grace: Duration,
     /// Bounded per-client out-queue depth; overflow forces a detach.
     pub out_queue: usize,
+    /// Interval for the tcgetpgrp `running` fallback poll (non-OSC-133 shells).
+    pub status_poll: Duration,
 }
 
 impl Default for ServerOpts {
@@ -42,6 +44,7 @@ impl Default for ServerOpts {
             dead_grace: Duration::from_secs(30),
             exit_grace: Duration::from_secs(5),
             out_queue: 1024,
+            status_poll: Duration::from_millis(300),
         }
     }
 }
@@ -103,6 +106,7 @@ fn forward_data(client: &mut Option<mpsc::Sender<Frame>>, data: &[u8]) {
 fn attach_client(
     session: &mut Session,
     client: &mut Option<mpsc::Sender<Frame>>,
+    poll_running: bool,
     req: AttachRequest,
 ) {
     let _ = session.resize(req.cols, req.rows);
@@ -110,7 +114,9 @@ fn attach_client(
     for f in frame_data(&replay.data) {
         let _ = req.out_tx.try_send(f);
     }
-    let _ = req.out_tx.try_send(status_frame(replay.status));
+    let _ = req
+        .out_tx
+        .try_send(status_frame(effective_status(session, poll_running)));
     if let Lifecycle::Dead { status } = session.lifecycle() {
         let _ = req.out_tx.try_send(exit_frame(status));
     }
@@ -248,6 +254,26 @@ async fn collect_sessions(registry: &Registry) -> Vec<SessionInfo> {
     out
 }
 
+/// Effective `running`: the engine's value once the shell has shown OSC 133
+/// prompt marking, otherwise the tcgetpgrp poll value.
+fn merge_running(has_marking: bool, engine_running: bool, poll_running: bool) -> bool {
+    if has_marking {
+        engine_running
+    } else {
+        poll_running
+    }
+}
+
+/// Build the STATUS snapshot the client should see: merged `running`, engine
+/// `progress`.
+fn effective_status(session: &Session, poll_running: bool) -> StatusSnapshot {
+    let snap = session.status();
+    StatusSnapshot {
+        running: merge_running(session.has_prompt_marking(), snap.running, poll_running),
+        progress: snap.progress,
+    }
+}
+
 /// The per-session actor: owns the `Session`, drains the PTY, and forwards
 /// frames to at most one client. Returns when the session ends; always removes
 /// itself from the registry on the way out.
@@ -278,6 +304,10 @@ pub(crate) async fn actor_loop(
     // just before the takeover would linger in the old client's socket buffer
     // and defeat the "next recv is EOF" contract.
     let mut last_status: Option<StatusSnapshot> = None;
+    // Latest tcgetpgrp fallback result (used until OSC 133 prompt marking shows).
+    let mut poll_running = false;
+    let mut poll = tokio::time::interval(opts.status_poll);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Set only after the child exits (dead-session retention deadline). `Instant`
     // is `Copy`, so the timer arm captures it by value — no borrow conflict with
     // the readable arm that reassigns it.
@@ -329,10 +359,13 @@ pub(crate) async fn actor_loop(
                         }
                     }
                     Some(SessionCommand::Attach(req)) => {
-                        attach_client(&mut session, &mut client, req);
+                        if !session.has_prompt_marking() {
+                            poll_running = session.poll_running();
+                        }
+                        attach_client(&mut session, &mut client, poll_running, req);
                         // The replay already carried a fresh STATUS to the new
                         // client; record it so live drains don't re-send it.
-                        last_status = Some(session.status());
+                        last_status = Some(effective_status(&session, poll_running));
                         if session.is_dead() {
                             // Final output + EXIT already queued; flush by ending.
                             break;
@@ -355,9 +388,10 @@ pub(crate) async fn actor_loop(
                         if !outcome.data.is_empty() {
                             forward_data(&mut client, &outcome.data);
                         }
-                        if last_status != Some(outcome.status) {
-                            push_or_drop(&mut client, status_frame(outcome.status));
-                            last_status = Some(outcome.status);
+                        let eff = effective_status(&session, poll_running);
+                        if last_status != Some(eff) {
+                            push_or_drop(&mut client, status_frame(eff));
+                            last_status = Some(eff);
                         }
                         if let Some(code) = outcome.exit {
                             push_or_drop(&mut client, exit_frame(code));
@@ -395,6 +429,18 @@ pub(crate) async fn actor_loop(
                     let _ = session.kill();
                 }
                 kill_deadline = None;
+            }
+
+            _ = poll.tick(), if client.is_some()
+                && !session.is_dead()
+                && !session.has_prompt_marking() =>
+            {
+                poll_running = session.poll_running();
+                let eff = effective_status(&session, poll_running);
+                if last_status != Some(eff) {
+                    push_or_drop(&mut client, status_frame(eff));
+                    last_status = Some(eff);
+                }
             }
         }
     }
@@ -617,6 +663,14 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_running_prefers_engine_when_marked_else_poll() {
+        assert!(super::merge_running(true, true, false)); // marked -> engine
+        assert!(!super::merge_running(true, false, true)); // marked -> engine
+        assert!(super::merge_running(false, false, true)); // unmarked -> poll
+        assert!(!super::merge_running(false, true, false)); // unmarked -> poll
     }
 
     #[tokio::test]

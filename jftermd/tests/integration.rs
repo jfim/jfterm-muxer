@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use jftermd::protocol::{
     AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
-    SessionInfo,
+    SessionInfo, StatusMsg,
 };
 use jftermd::registry::Registry;
 use jftermd::server::{ServerOpts, run};
@@ -158,6 +158,57 @@ async fn recv_data_until(c: &mut Conn, needle: &[u8], timeout: Duration) -> Vec<
             None => return acc,
         }
     }
+}
+
+async fn recv_status_until(c: &mut Conn, want_running: bool, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match c.recv(remaining).await {
+            Some(f) if f.ty == FrameType::Status => {
+                if let Ok(m) = f.json::<StatusMsg>()
+                    && m.running == want_running
+                {
+                    return true;
+                }
+            }
+            Some(_) => {}
+            None => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn running_falls_back_to_tcgetpgrp_without_osc133() {
+    let opts = ServerOpts {
+        status_poll: Duration::from_millis(100),
+        ..ServerOpts::default()
+    };
+    let h = Harness::start(opts).await;
+    let mut c = h.connect().await;
+    // bash --norc -i: job control on, no OSC 133 -> the poll drives `running`.
+    c.send(&attach_or_open(
+        "poll",
+        argv(&["bash", "--norc", "-i"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    let _ = recv_data_until(&mut c, b"$", Duration::from_secs(3)).await;
+    c.send(&Frame::new(FrameType::Input, b"sleep 0.6\n".to_vec()))
+        .await;
+    assert!(
+        recv_status_until(&mut c, true, Duration::from_secs(3)).await,
+        "fallback should report running=true while `sleep` is foreground"
+    );
+    assert!(
+        recv_status_until(&mut c, false, Duration::from_secs(3)).await,
+        "fallback should report running=false back at the prompt"
+    );
 }
 
 async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) {

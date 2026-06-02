@@ -12,7 +12,7 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{Pid, chdir, execvpe, getpgid, read, write};
+use nix::unistd::{Pid, chdir, execvpe, getpgid, read, tcgetpgrp, write};
 
 // TIOCSWINSZ ioctl for resizing the master after fork.
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
@@ -175,6 +175,15 @@ impl Pty {
         killpg(self.child, Signal::SIGWINCH).map_err(io_err)
     }
 
+    /// True when a foreground process group other than the shell itself owns the
+    /// terminal — i.e. a command is running. The `running` fallback for shells
+    /// without OSC 133. (Only ever true under an interactive, job-control shell;
+    /// a non-job-control `sh -c` keeps everything in the leader's group.)
+    pub fn foreground_busy(&self) -> io::Result<bool> {
+        let fg = tcgetpgrp(&self.master).map_err(io_err)?;
+        Ok(fg != self.child)
+    }
+
     /// SIGHUP the child's process group (Close).
     pub fn hangup(&self) -> io::Result<()> {
         killpg(self.child, Signal::SIGHUP).map_err(io_err)
@@ -310,6 +319,24 @@ mod tests {
         let pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
         pty.resize(winsize(120, 40)).expect("resize");
         pty.hangup().expect("hangup");
+    }
+
+    #[test]
+    fn foreground_not_busy_at_prompt() {
+        let mut pty = Pty::spawn(
+            &argv(&["bash", "--norc", "-i"]),
+            Path::new("/"),
+            winsize(80, 24),
+        )
+        .expect("spawn");
+        // Let bash take the terminal and print its prompt.
+        let _ = read_until(&mut pty, b"$", Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !pty.foreground_busy().expect("tcgetpgrp"),
+            "a shell at its prompt should not be foreground-busy"
+        );
+        pty.hangup().ok();
     }
 
     #[test]
