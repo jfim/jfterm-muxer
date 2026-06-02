@@ -22,7 +22,7 @@ use crate::protocol::{
     AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
     Resize, SessionInfo, StatusMsg, frame_data,
 };
-use crate::registry::{AttachRequest, Bind, Registry, SessionCommand};
+use crate::registry::{AttachRequest, Bind, MAX_SESSIONS, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
 
 /// Tunable runtime knobs (overridable in tests; CLI sets them later).
@@ -518,6 +518,14 @@ async fn handle_session(
             ));
             cmd_tx
         }
+        Bind::Rejected => {
+            tracing::warn!(
+                max = MAX_SESSIONS,
+                id = %req.session_id,
+                "session cap reached; refusing to open a new session"
+            );
+            return Ok(()); // close the connection; no new shell is spawned
+        }
     };
 
     let (out_tx, out_rx) = mpsc::channel::<Frame>(opts.out_queue);
@@ -771,6 +779,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = match reg.attach_or_create("a1") {
             Bind::Created { cmd_tx, cmd_rx } => (cmd_tx, cmd_rx),
             Bind::Existing(_) => panic!("fresh id should be Created"),
+            Bind::Rejected => panic!("fresh id should not be capped"),
         };
         let task = tokio::spawn(actor_loop(
             session,
@@ -828,6 +837,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = match reg.attach_or_create("d1") {
             Bind::Created { cmd_tx, cmd_rx } => (cmd_tx, cmd_rx),
             Bind::Existing(_) => panic!("fresh id should be Created"),
+            Bind::Rejected => panic!("fresh id should not be capped"),
         };
         let task = tokio::spawn(actor_loop(session, "d1".into(), cmd_rx, reg.clone(), opts));
 

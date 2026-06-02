@@ -42,12 +42,20 @@ pub struct SessionHandle {
     pub(crate) cmd_tx: mpsc::Sender<SessionCommand>,
 }
 
+/// Hard cap on concurrently-tracked sessions. A fresh `session_id` forks a
+/// shell + spawns an actor + a channel + a replay ring, so an uncapped client
+/// looping over random ids is a fork bomb / memory-exhaustion vector. 256
+/// simultaneous shells is already well past any realistic interactive use.
+pub const MAX_SESSIONS: usize = 256;
+
 /// The shared session table.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Registry {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     /// Pulsed whenever the session set changes, so the self-exit watcher rechecks.
     ended: Notify,
+    /// Refuse to create a new session once this many exist (see `MAX_SESSIONS`).
+    max_sessions: usize,
 }
 
 /// Outcome of `attach_or_create`: whether the caller must spawn the actor.
@@ -60,20 +68,36 @@ pub enum Bind {
         cmd_tx: mpsc::Sender<SessionCommand>,
         cmd_rx: mpsc::Receiver<SessionCommand>,
     },
+    /// The session cap is reached; no new session was created. Reattaching to
+    /// an existing id is still allowed (it returns `Existing`).
+    Rejected,
 }
 
 impl Registry {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_max_sessions(MAX_SESSIONS)
     }
 
-    /// Race-free: if `id` exists return its channel, else insert a fresh handle
-    /// and return the receiver for the caller to spawn an actor around. The
-    /// whole check-and-insert happens under the lock with no `.await`.
+    /// Construct with an explicit session cap (used by tests).
+    pub fn with_max_sessions(max_sessions: usize) -> Arc<Self> {
+        Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            ended: Notify::new(),
+            max_sessions,
+        })
+    }
+
+    /// Race-free: if `id` exists return its channel, else (if under the cap)
+    /// insert a fresh handle and return the receiver for the caller to spawn an
+    /// actor around. The whole check-and-insert happens under the lock with no
+    /// `.await`. Returns `Rejected` when the cap is reached for a new id.
     pub fn attach_or_create(&self, id: &str) -> Bind {
         let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = map.get(id) {
             return Bind::Existing(h.cmd_tx.clone());
+        }
+        if map.len() >= self.max_sessions {
+            return Bind::Rejected;
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         map.insert(
@@ -134,6 +158,21 @@ mod tests {
         reg.remove("s1");
         assert!(reg.is_empty());
         assert!(reg.handles().iter().all(|(id, _)| id != "s1"));
+    }
+
+    #[test]
+    fn new_sessions_rejected_at_cap_but_reattach_still_works() {
+        let reg = Registry::with_max_sessions(2);
+        // Fill to the cap.
+        assert!(matches!(reg.attach_or_create("s1"), Bind::Created { .. }));
+        assert!(matches!(reg.attach_or_create("s2"), Bind::Created { .. }));
+        // A new id beyond the cap is rejected.
+        assert!(matches!(reg.attach_or_create("s3"), Bind::Rejected));
+        // Reattaching to an existing id is still allowed at the cap.
+        assert!(matches!(reg.attach_or_create("s1"), Bind::Existing(_)));
+        // Freeing a slot lets a new id in again.
+        reg.remove("s2");
+        assert!(matches!(reg.attach_or_create("s3"), Bind::Created { .. }));
     }
 
     #[test]
