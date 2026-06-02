@@ -13,6 +13,7 @@ pub struct StatusSnapshot {
 pub struct StatusCache {
     running: bool,
     progress: Option<u8>,
+    saw_prompt_marker: bool,
 }
 
 impl StatusCache {
@@ -20,6 +21,7 @@ impl StatusCache {
         Self {
             running: false,
             progress: None,
+            saw_prompt_marker: false,
         }
     }
 
@@ -29,6 +31,14 @@ impl StatusCache {
 
     pub fn set_progress(&mut self, progress: Option<u8>) {
         self.progress = progress;
+    }
+
+    pub fn set_prompt_marker_seen(&mut self) {
+        self.saw_prompt_marker = true;
+    }
+
+    pub fn saw_prompt_marker(&self) -> bool {
+        self.saw_prompt_marker
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -73,5 +83,13 @@ mod tests {
         c.set_progress(Some(10));
         c.set_progress(None);
         assert_eq!(c.snapshot().progress, None);
+    }
+
+    #[test]
+    fn prompt_marker_latches() {
+        let mut c = StatusCache::new();
+        assert!(!c.saw_prompt_marker());
+        c.set_prompt_marker_seen();
+        assert!(c.saw_prompt_marker());
     }
 }

@@ -37,6 +37,13 @@ impl ReplayEngine {
     pub fn status(&self) -> StatusSnapshot {
         self.scanner.status()
     }
+
+    /// Whether the shell uses OSC 133 prompt marking (latched on the first
+    /// marker of any subtype). Until true, the daemon supplies `running` from a
+    /// tcgetpgrp poll.
+    pub fn has_prompt_marking(&self) -> bool {
+        self.scanner.saw_prompt_marker()
+    }
 }
 
 impl Default for ReplayEngine {
@@ -68,5 +75,21 @@ mod tests {
         let out = e.replay();
         assert!(out.windows(8).any(|w| w == b"line one"));
         assert!(out.windows(8).any(|w| w == b"line two"));
+    }
+
+    #[test]
+    fn has_prompt_marking_latches_on_first_osc133_any_subtype() {
+        let mut e = ReplayEngine::new();
+        assert!(!e.has_prompt_marking());
+        // 133;A (prompt start) is not C/D but must still latch.
+        e.feed(b"\x1b]133;A\x07");
+        assert!(e.has_prompt_marking());
+    }
+
+    #[test]
+    fn no_prompt_marking_without_osc133() {
+        let mut e = ReplayEngine::new();
+        e.feed(b"plain output\r\n");
+        assert!(!e.has_prompt_marking());
     }
 }

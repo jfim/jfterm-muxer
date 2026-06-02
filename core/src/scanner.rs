@@ -107,6 +107,9 @@ impl Perform for Sink {
                 self.event = SegEvent::DropSeq;
             }
             Some("133") => {
+                // Any OSC 133 marker means this shell does prompt marking; latch
+                // it so the daemon disables its tcgetpgrp running fallback.
+                self.status.set_prompt_marker_seen();
                 match params.get(1).and_then(|p| p.first()) {
                     Some(b'C') => self.status.set_running(true),
                     Some(b'D') => self.status.set_running(false),
@@ -280,6 +283,11 @@ impl Scanner {
     /// Current shell-status snapshot.
     pub fn status(&self) -> StatusSnapshot {
         self.sink.status.snapshot()
+    }
+
+    /// Whether any OSC 133 prompt marker has been observed (latched).
+    pub fn saw_prompt_marker(&self) -> bool {
+        self.sink.status.saw_prompt_marker()
     }
 
     fn maybe_cut(&mut self) {
