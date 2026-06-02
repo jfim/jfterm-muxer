@@ -103,7 +103,7 @@ impl Pty {
         let res = {
             let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: child path touches only async-signal-safe syscalls.
-            unsafe { forkpty(Some(&ws), None) }.map_err(io_err)?
+            unsafe { forkpty(Some(&ws), None) }?
         };
         match res {
             ForkptyResult::Parent { master, child } => {
@@ -156,7 +156,7 @@ impl Pty {
 
     /// Write keystroke bytes to the shell. Returns bytes written.
     pub fn write_input(&self, data: &[u8]) -> io::Result<usize> {
-        write(&self.master, data).map_err(io_err)
+        Ok(write(&self.master, data)?)
     }
 
     /// Read all currently-available output until EAGAIN or EOF.
@@ -179,7 +179,7 @@ impl Pty {
                     out.eof = true;
                     return Ok(out);
                 }
-                Err(e) => return Err(io_err(e)),
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -187,14 +187,14 @@ impl Pty {
     /// Apply a new winsize and SIGWINCH the child's process group.
     pub fn resize(&self, ws: Winsize) -> io::Result<()> {
         // SAFETY: master is a valid fd; ws outlives the call.
-        unsafe { tiocswinsz(self.master.as_raw_fd(), &ws) }.map_err(io_err)?;
+        unsafe { tiocswinsz(self.master.as_raw_fd(), &ws) }?;
         self.sigwinch()
     }
 
     /// SIGWINCH the child's process group (it is its own group leader after
     /// forkpty's setsid, so the pgid equals the child pid).
     pub fn sigwinch(&self) -> io::Result<()> {
-        killpg(self.child, Signal::SIGWINCH).map_err(io_err)
+        Ok(killpg(self.child, Signal::SIGWINCH)?)
     }
 
     /// True when a foreground process group other than the shell itself owns the
@@ -202,18 +202,18 @@ impl Pty {
     /// without OSC 133. (Only ever true under an interactive, job-control shell;
     /// a non-job-control `sh -c` keeps everything in the leader's group.)
     pub fn foreground_busy(&self) -> io::Result<bool> {
-        let fg = tcgetpgrp(&self.master).map_err(io_err)?;
+        let fg = tcgetpgrp(&self.master)?;
         Ok(fg != self.child)
     }
 
     /// SIGHUP the child's process group (Close).
     pub fn hangup(&self) -> io::Result<()> {
-        killpg(self.child, Signal::SIGHUP).map_err(io_err)
+        Ok(killpg(self.child, Signal::SIGHUP)?)
     }
 
     /// SIGKILL the child's process group (CLOSE escalation).
     pub fn kill(&self) -> io::Result<()> {
-        killpg(self.child, Signal::SIGKILL).map_err(io_err)
+        Ok(killpg(self.child, Signal::SIGKILL)?)
     }
 
     /// Non-blocking reap. `Some(status)` once reaped (128+sig for signals),
@@ -231,7 +231,7 @@ impl Pty {
             // No child to wait for yet (e.g. status not reapable this instant);
             // do not invent a 0 — let the caller spin for the real status.
             Err(nix::errno::Errno::ECHILD) => Ok(None),
-            Err(e) => Err(io_err(e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -255,7 +255,7 @@ impl Pty {
                 // Already reaped elsewhere: the real code is genuinely
                 // unrecoverable, but we still must not fabricate one.
                 Err(nix::errno::Errno::ECHILD) => return Ok(None),
-                Err(e) => return Err(io_err(e)),
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(None)
@@ -276,17 +276,13 @@ impl Drop for Pty {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io_err)?;
+    fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
 fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
-    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io_err)?;
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
     Ok(())
-}
-
-fn io_err(e: nix::errno::Errno) -> io::Error {
-    io::Error::from_raw_os_error(e as i32)
 }
 
 #[cfg(test)]

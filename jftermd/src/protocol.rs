@@ -105,6 +105,12 @@ impl std::error::Error for ProtocolError {}
 /// shift per frame.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
 
+impl From<ProtocolError> for std::io::Error {
+    fn from(e: ProtocolError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    }
+}
+
 /// Accumulates bytes off a socket and yields whole `Frame`s. Handles frames
 /// split across reads and multiple frames in one read.
 #[derive(Debug, Default)]
