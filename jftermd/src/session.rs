@@ -216,8 +216,8 @@ impl Session {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .expect("system clock before UNIX_EPOCH")
+        .as_secs()
 }
 
 #[cfg(test)]
