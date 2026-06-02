@@ -68,6 +68,7 @@ impl Frame {
     }
 
     /// Serialize to the wire: `[type][len:u32 BE][value]`.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(
             self.payload.len() <= MAX_FRAME_LEN as usize,
