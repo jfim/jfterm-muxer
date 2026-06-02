@@ -86,13 +86,13 @@ impl Perform for Sink {
         match code {
             Some("0") | Some("1") | Some("2") => {
                 if let Some(text) = params.get(1) {
-                    self.sticky.set_title(Some(text.to_vec()));
+                    self.sticky.set_title(text.to_vec());
                 }
                 self.event = SegEvent::KeepSeq;
             }
             Some("7") => {
                 if let Some(cwd) = params.get(1) {
-                    self.sticky.set_cwd(Some(cwd.to_vec()));
+                    self.sticky.set_cwd(cwd.to_vec());
                 }
                 self.event = SegEvent::KeepSeq;
             }

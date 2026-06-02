@@ -53,13 +53,13 @@ impl StickyState {
         self.invalidate();
     }
 
-    pub fn set_cwd(&mut self, cwd: Option<Vec<u8>>) {
-        self.cwd = cwd;
+    pub fn set_cwd(&mut self, cwd: Vec<u8>) {
+        self.cwd = Some(cwd);
         self.invalidate();
     }
 
-    pub fn set_title(&mut self, title: Option<Vec<u8>>) {
-        self.title = title;
+    pub fn set_title(&mut self, title: Vec<u8>) {
+        self.title = Some(title);
         self.invalidate();
     }
 
@@ -164,8 +164,8 @@ mod tests {
     fn scroll_region_and_cwd_and_title() {
         let mut s = StickyState::new();
         s.set_scroll_region(Some((2, 24))); // stored as the 1-based CSI params
-        s.set_cwd(Some(b"file:///home/jfim".to_vec()));
-        s.set_title(Some(b"vim".to_vec()));
+        s.set_cwd(b"file:///home/jfim".to_vec());
+        s.set_title(b"vim".to_vec());
         let out = s.serialize();
         assert_eq!(
             out,
