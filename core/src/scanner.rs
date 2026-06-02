@@ -143,11 +143,7 @@ impl Perform for Sink {
             }
             'm' if !is_private => {
                 self.sgr_scratch.clear();
-                for sub in params.iter() {
-                    for v in sub {
-                        self.sgr_scratch.push(*v);
-                    }
-                }
+                self.sgr_scratch.extend(params.iter().flatten().copied());
                 if self.sgr_scratch.is_empty() || self.sgr_scratch.as_slice() == [0u16] {
                     self.sticky.set_sgr(&[]);
                 } else {
