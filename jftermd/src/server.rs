@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use crate::protocol::{
-    AttachOrOpen, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, ProtocolError,
-    Resize, SessionInfo, StatusMsg, frame_data,
+    AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
+    ProtocolError, Resize, SessionInfo, StatusMsg, frame_data,
 };
 use crate::registry::{AttachRequest, Bind, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
@@ -282,6 +282,11 @@ pub(crate) async fn actor_loop(
     // is `Copy`, so the timer arm captures it by value — no borrow conflict with
     // the readable arm that reassigns it.
     let mut grace_deadline: Option<Instant> = None;
+    // Set once a CLOSE arrives; the next exit-detecting drain ends the actor
+    // (instead of arming dead-session retention).
+    let mut closing = false;
+    // Set on CLOSE{grace_ms>0}: SIGKILL-escalation deadline.
+    let mut kill_deadline: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -299,32 +304,29 @@ pub(crate) async fn actor_loop(
                     Some(SessionCommand::Info(reply)) => {
                         let _ = reply.send(session.info(client.is_some()));
                     }
-                    Some(SessionCommand::Close) => {
-                        // close() blocks (SIGHUP + bounded reap spin); run it off
-                        // the loop. If the blocking task panics the session is
-                        // lost, but we still fall through to break -> the
-                        // `registry.remove` below cleans up the handle so a panic
-                        // can never leak a session id.
-                        match tokio::task::spawn_blocking(move || {
-                            let _ = session.close();
-                            session
-                        })
-                        .await
-                        {
-                            Ok(closed) => {
-                                let code = match closed.lifecycle() {
-                                    Lifecycle::Dead { status } => status,
-                                    Lifecycle::Live => 0,
-                                };
-                                if let Some(tx) = client.take() {
-                                    let _ = tx.try_send(exit_frame(code));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(%id, error = %e, "close task panicked");
-                            }
+                    Some(SessionCommand::Close { grace_ms }) => {
+                        // Force-close: SIGHUP the group now (non-blocking); if it
+                        // is still alive at the deadline, escalate to SIGKILL.
+                        // Reaping stays EOF-driven (the readable arm); we keep the
+                        // session in the registry until reaped so idle self-exit
+                        // can't fire mid-reap and orphan the child.
+                        let _ = session.hangup();
+                        closing = true;
+                        if grace_ms > 0 {
+                            kill_deadline =
+                                Some(Instant::now() + Duration::from_millis(grace_ms as u64));
                         }
-                        break;
+                        if session.is_dead() {
+                            // Raced (already gone): tell any client and end now.
+                            let code = match session.lifecycle() {
+                                Lifecycle::Dead { status } => status,
+                                Lifecycle::Live => 0,
+                            };
+                            if let Some(tx) = client.take() {
+                                let _ = tx.try_send(exit_frame(code));
+                            }
+                            break;
+                        }
                     }
                     Some(SessionCommand::Attach(req)) => {
                         attach_client(&mut session, &mut client, req);
@@ -359,6 +361,9 @@ pub(crate) async fn actor_loop(
                         }
                         if let Some(code) = outcome.exit {
                             push_or_drop(&mut client, exit_frame(code));
+                            if closing {
+                                break; // reaped after CLOSE -> end + registry.remove
+                            }
                             grace_deadline = Some(Instant::now() + opts.dead_grace);
                         }
                     }
@@ -376,6 +381,20 @@ pub(crate) async fn actor_loop(
                 }
             }, if grace_deadline.is_some() => {
                 break;
+            }
+
+            () = async {
+                match kill_deadline {
+                    Some(d) => sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if kill_deadline.is_some() => {
+                // Grace elapsed; if still not reaped, force-kill the whole group.
+                // Fire once — the readable arm then sees EOF -> reap -> break.
+                if !session.is_dead() {
+                    let _ = session.kill();
+                }
+                kill_deadline = None;
             }
         }
     }
@@ -514,7 +533,9 @@ async fn reader_task(
                         }
                     }
                     FrameType::Close => {
-                        let _ = cmd_tx.send(SessionCommand::Close).await;
+                        // Empty or malformed payload defaults to grace_ms = 0.
+                        let grace_ms = frame.json::<CloseMsg>().map(|m| m.grace_ms).unwrap_or(0);
+                        let _ = cmd_tx.send(SessionCommand::Close { grace_ms }).await;
                         break 'outer;
                     }
                     other => tracing::warn!(?other, "unexpected session frame; ignoring"),
@@ -651,7 +672,10 @@ mod tests {
         let got = collect_data_until(&mut out_rx, b"PING", Duration::from_secs(3)).await;
         assert!(contains(&got, b"PING"), "input did not round-trip");
 
-        cmd_tx.send(SessionCommand::Close).await.unwrap();
+        cmd_tx
+            .send(SessionCommand::Close { grace_ms: 0 })
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("actor should end after Close")

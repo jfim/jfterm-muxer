@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jftermd::protocol::{
-    AttachOrOpen, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, SessionInfo,
+    AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
+    SessionInfo,
 };
 use jftermd::registry::Registry;
 use jftermd::server::{ServerOpts, run};
@@ -169,6 +170,48 @@ async fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) {
     }
 }
 
+fn close_frame(grace_ms: u32) -> Frame {
+    Frame::control(FrameType::Close, &CloseMsg { grace_ms }).unwrap()
+}
+
+#[tokio::test]
+async fn close_grace_zero_reaps_without_escalation() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c = h.connect().await;
+    c.send(&attach_or_open("cz", argv(&["cat"]), 0, 80, 24))
+        .await;
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
+    c.send(&close_frame(0)).await; // SIGHUP only; cat dies on SIGHUP
+    wait_until(Duration::from_secs(3), || h.registry.is_empty()).await;
+    assert!(
+        h.registry.is_empty(),
+        "CLOSE{{0}} should reap a SIGHUP-dying shell"
+    );
+}
+
+#[tokio::test]
+async fn close_escalates_to_sigkill_when_child_ignores_sighup() {
+    let h = Harness::start(ServerOpts::default()).await;
+    let mut c = h.connect().await;
+    // Ignores SIGHUP and runs forever -> only SIGKILL can end it.
+    c.send(&attach_or_open(
+        "esc",
+        argv(&["sh", "-c", "trap \"\" HUP; while :; do sleep 1; done"]),
+        0,
+        80,
+        24,
+    ))
+    .await;
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
+    c.send(&close_frame(300)).await;
+    // Without escalation this never empties; with it, ~300ms later.
+    wait_until(Duration::from_secs(4), || h.registry.is_empty()).await;
+    assert!(
+        h.registry.is_empty(),
+        "SIGKILL escalation should reap a HUP-ignoring child"
+    );
+}
+
 #[tokio::test]
 async fn open_drains_then_reattach_replays_scrollback() {
     let h = Harness::start(ServerOpts::default()).await;
@@ -235,7 +278,8 @@ async fn socket_drop_detaches_but_keeps_shell_running() {
     .await;
     let _ = recv_data_until(&mut c, b"START", Duration::from_secs(3)).await;
     drop(c);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Detach keeps the shell alive, so the session must remain in the registry.
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
     assert!(!h.registry.is_empty(), "detach must not kill the shell");
 
     let mut c2 = h.connect().await;
@@ -294,7 +338,9 @@ async fn backpressure_drops_stalled_client_without_disturbing_shell() {
     .await;
 
     // Do NOT read c1: the bounded out-queue overflows and the daemon drops it.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // The session is created only once the accept loop has processed the first
+    // frame, so confirm it exists before asserting the shell survives the drop.
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
     assert!(
         !h.registry.is_empty(),
         "backpressure must not kill the shell"
@@ -340,8 +386,17 @@ async fn shell_exit_while_detached_retains_dead_session_then_replays_exit() {
         24,
     ))
     .await;
-    // Detach BEFORE the shell exits.
+    // The session is created only once the accept loop has processed the first
+    // frame; confirm it exists before detaching so the drop can't race creation.
+    // (No output is emitted until the shell's 0.3s sleep elapses, so the registry
+    // is the only creation signal available here.)
+    wait_until(Duration::from_secs(3), || !h.registry.is_empty()).await;
+    // Detach BEFORE the shell exits (it sleeps 0.3s first).
     drop(c);
+    // Let the shell exit *while detached* so reattach exercises the dead-session
+    // replay path; the dead session is retained for dead_grace (10s). With
+    // creation already confirmed, this only needs to cover the shell's own
+    // wall-clock 0.3s sleep, so it is robust to scheduler jitter.
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert!(!h.registry.is_empty(), "dead session must be retained");
 
