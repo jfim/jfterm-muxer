@@ -23,8 +23,9 @@ impl StickyState {
         Self::default()
     }
 
-    pub fn set_sgr(&mut self, params: Vec<u16>) {
-        self.sgr = params;
+    pub fn set_sgr(&mut self, params: &[u16]) {
+        self.sgr.clear();
+        self.sgr.extend_from_slice(params);
     }
 
     pub fn set_dec_mode(&mut self, code: u16, on: bool) {
@@ -109,7 +110,7 @@ mod tests {
     #[test]
     fn sgr_is_reasserted() {
         let mut s = StickyState::new();
-        s.set_sgr(vec![1, 31]); // bold, fg red
+        s.set_sgr(&[1, 31]); // bold, fg red
         let out = s.serialize();
         assert_eq!(out, b"\x1b[0m\x1b[1;31m".to_vec());
     }

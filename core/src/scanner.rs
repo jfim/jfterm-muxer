@@ -29,6 +29,9 @@ struct Sink {
     /// directly-following ST terminator (`ESC \`) is classified the same way
     /// instead of leaking a stray backslash (drop) or splitting the ST (keep).
     st_pending: Option<SegEvent>,
+    /// Reused scratch buffer for flattening SGR params, so the `'m'` arm does
+    /// not allocate a fresh `Vec` on every SGR sequence.
+    sgr_scratch: Vec<u16>,
 }
 
 impl Sink {
@@ -38,6 +41,7 @@ impl Sink {
             status: StatusCache::new(),
             event: SegEvent::None,
             st_pending: None,
+            sgr_scratch: Vec::new(),
         }
     }
 
@@ -138,16 +142,16 @@ impl Perform for Sink {
                 self.event = SegEvent::DropSeq;
             }
             'm' if !is_private => {
-                let mut flat = Vec::new();
+                self.sgr_scratch.clear();
                 for sub in params.iter() {
                     for v in sub {
-                        flat.push(*v);
+                        self.sgr_scratch.push(*v);
                     }
                 }
-                if flat.is_empty() || flat.as_slice() == [0u16] {
-                    self.sticky.set_sgr(Vec::new());
+                if self.sgr_scratch.is_empty() || self.sgr_scratch.as_slice() == [0u16] {
+                    self.sticky.set_sgr(&[]);
                 } else {
-                    self.sticky.set_sgr(flat);
+                    self.sticky.set_sgr(&self.sgr_scratch);
                 }
                 self.event = SegEvent::KeepSeq;
             }
