@@ -58,7 +58,10 @@ pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire>
     let listener = match UnixListener::bind(sock_path) {
         Ok(l) => l,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
-            std::fs::remove_file(sock_path).ok();
+            // Only treat the leftover as a stale socket of ours: it must be a
+            // socket (S_ISSOCK) owned by the current uid before we unlink it.
+            // Refuse to unconditionally remove an arbitrary file at this path.
+            unlink_stale_socket(sock_path)?;
             UnixListener::bind(sock_path)?
         }
         Err(e) => return Err(e),
@@ -66,6 +69,30 @@ pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire>
     // FD_CLOEXEC: the listening socket fd must not leak into spawned shells.
     set_cloexec(&listener)?;
     Ok(Acquire::Bound { lock, listener })
+}
+
+/// Unlink a leftover socket file, but only if it really is a socket owned by
+/// the current uid. Refuses (errors) on anything else so a planted regular
+/// file, directory, or another user's node is never silently removed.
+fn unlink_stale_socket(sock_path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // lstat: do not follow a symlink planted at the socket path.
+    let md = std::fs::symlink_metadata(sock_path)?;
+    if !md.file_type().is_socket() {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "refusing to unlink non-socket file at socket path",
+        ));
+    }
+    // SAFETY: getuid is always safe.
+    let uid = unsafe { libc::getuid() };
+    if md.uid() != uid {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to unlink socket not owned by current user",
+        ));
+    }
+    std::fs::remove_file(sock_path)
 }
 
 /// Set FD_CLOEXEC on a file descriptor so it is not inherited across exec.
@@ -156,11 +183,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("muxer.sock");
         let lock = dir.path().join("muxer.lock");
-        std::fs::write(&sock, b"stale").unwrap();
+        // A genuine leftover socket node (no live listener): binding hits
+        // AddrInUse, and since it is a socket owned by us it is unlinked + rebound.
+        let stale = UnixListener::bind(&sock).unwrap();
+        drop(stale);
+        std::fs::write(dir.path().join("touch"), b"").unwrap(); // keep dir alive
         let acq = acquire_daemon(&sock, &lock).unwrap();
         assert!(matches!(acq, Acquire::Bound { .. }));
         assert!(std::os::unix::net::UnixStream::connect(&sock).is_ok());
         drop(acq);
+    }
+
+    #[test]
+    fn refuses_to_unlink_non_socket_at_socket_path() {
+        // A regular file occupying the socket path must NOT be silently removed.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("muxer.sock");
+        std::fs::write(&sock, b"not a socket").unwrap();
+        assert!(unlink_stale_socket(&sock).is_err());
+        assert!(sock.exists(), "regular file must be left in place");
     }
 
     #[test]
