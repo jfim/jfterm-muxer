@@ -100,11 +100,20 @@ impl std::fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+/// Compact the read buffer once consumed bytes pass this threshold, so a long
+/// run of small frames neither grows the buffer unbounded nor pays an O(n)
+/// shift per frame.
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+
 /// Accumulates bytes off a socket and yields whole `Frame`s. Handles frames
 /// split across reads and multiple frames in one read.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    /// Offset of the first unconsumed byte in `buf`. Consumed frames advance
+    /// this cursor instead of draining the front (which would be O(n) per
+    /// frame); `buf` is compacted only once `pos` crosses `COMPACT_THRESHOLD`.
+    pos: usize,
 }
 
 impl FrameDecoder {
@@ -114,27 +123,44 @@ impl FrameDecoder {
 
     /// Append freshly-read bytes to the internal buffer.
     pub fn push(&mut self, bytes: &[u8]) {
+        // Drop already-consumed bytes before appending so the buffer does not
+        // grow without bound across many push/next_frame cycles.
+        self.compact();
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Drop consumed bytes from the front of `buf` and reset the cursor.
+    fn compact(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+        self.buf.drain(..self.pos);
+        self.pos = 0;
     }
 
     /// Pop the next complete frame, or `Ok(None)` if more bytes are needed.
     /// A malformed type byte or oversized length is a hard `Err`.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
-        if self.buf.len() < 5 {
+        let avail = &self.buf[self.pos..];
+        if avail.len() < 5 {
             return Ok(None);
         }
-        let ty_byte = self.buf[0];
-        let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
+        let ty_byte = avail[0];
+        let len = u32::from_be_bytes([avail[1], avail[2], avail[3], avail[4]]);
         if len > MAX_FRAME_LEN {
             return Err(ProtocolError::FrameTooLarge(len));
         }
         let ty = FrameType::from_u8(ty_byte).ok_or(ProtocolError::UnknownType(ty_byte))?;
         let total = 5 + len as usize;
-        if self.buf.len() < total {
+        if avail.len() < total {
             return Ok(None);
         }
-        let payload = self.buf[5..total].to_vec();
-        self.buf.drain(..total);
+        let payload = avail[5..total].to_vec();
+        self.pos += total;
+        // Reclaim space eagerly once enough has been consumed.
+        if self.pos >= COMPACT_THRESHOLD {
+            self.compact();
+        }
         Ok(Some(Frame::new(ty, payload)))
     }
 }
