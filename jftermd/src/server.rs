@@ -431,6 +431,9 @@ pub(crate) async fn actor_loop(
                 kill_deadline = None;
             }
 
+            // Attach-gated `running` fallback for shells without OSC 133. This is
+            // best-effort: a foreground command shorter than `status_poll` can
+            // start and finish between ticks and never be seen as running.
             _ = poll.tick(), if client.is_some()
                 && !session.is_dead()
                 && !session.has_prompt_marking() =>

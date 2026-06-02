@@ -274,4 +274,33 @@ mod tests {
         assert!(info.running);
         assert!(info.has_client);
     }
+
+    #[test]
+    fn draining_osc133_latches_has_prompt_marking() {
+        // A shell that emits an OSC 133 marker should latch prompt marking once
+        // its output is drained into the engine — which is what permanently
+        // disables the daemon's tcgetpgrp `running` fallback. (The 133 sequence
+        // itself is stripped from the replay, so we poll `has_prompt_marking`.)
+        let mut s = Session::open(
+            "t133",
+            argv(&["sh", "-c", "printf '\\033]133;D\\007'; sleep 0.3"]),
+            "/",
+            80,
+            24,
+        )
+        .expect("open");
+        assert!(!s.has_prompt_marking());
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            let _ = s.drain().expect("drain");
+            if s.has_prompt_marking() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            s.has_prompt_marking(),
+            "draining OSC 133 output should latch prompt marking (engine becomes authoritative)"
+        );
+    }
 }
