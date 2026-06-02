@@ -86,6 +86,16 @@ fn push_or_drop(client: &mut Option<mpsc::Sender<Frame>>, frame: Frame) {
     }
 }
 
+/// A deadline future: resolves at `deadline` when set, or never when `None`.
+/// Lets a `select!` arm await an optional timer without a separate `if` guard
+/// (an unset deadline simply never fires).
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => sleep_until(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn forward_data(client: &mut Option<mpsc::Sender<Frame>>, data: &[u8]) {
     for f in frame_data(data) {
         push_or_drop(client, f);
@@ -431,21 +441,11 @@ pub(crate) async fn actor_loop(
                 }
             }
 
-            () = async {
-                match grace_deadline {
-                    Some(d) => sleep_until(d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if grace_deadline.is_some() => {
+            () = sleep_until_opt(grace_deadline) => {
                 break;
             }
 
-            () = async {
-                match kill_deadline {
-                    Some(d) => sleep_until(d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if kill_deadline.is_some() => {
+            () = sleep_until_opt(kill_deadline) => {
                 // Grace elapsed; if still not reaped, force-kill the whole group.
                 // Fire once — the readable arm then sees EOF -> reap -> break.
                 if !session.is_dead() {
