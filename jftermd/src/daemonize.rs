@@ -37,6 +37,8 @@ fn try_flock(lock_path: &Path) -> io::Result<Option<Flock<File>>> {
         // truncation would needlessly race other openers. Default is no-trunc.
         .truncate(false)
         .mode(0o600)
+        // FD_CLOEXEC: the daemon's lock fd must not leak into spawned shells.
+        .custom_flags(libc::O_CLOEXEC)
         .open(lock_path)?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(flock) => Ok(Some(flock)),
@@ -61,7 +63,16 @@ pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire>
         }
         Err(e) => return Err(e),
     };
+    // FD_CLOEXEC: the listening socket fd must not leak into spawned shells.
+    set_cloexec(&listener)?;
     Ok(Acquire::Bound { lock, listener })
+}
+
+/// Set FD_CLOEXEC on a file descriptor so it is not inherited across exec.
+fn set_cloexec<F: std::os::fd::AsFd>(fd: &F) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(errno_io)?;
+    Ok(())
 }
 
 /// `setsid` + double-fork into a daemon; `chdir("/")`; std fds -> `/dev/null`.
