@@ -391,6 +391,13 @@ pub(crate) async fn actor_loop(
                         // When detached, forward_data/push_or_drop below are
                         // no-ops, so skip recomputing the merged status entirely.
                         if client.is_some() {
+                            // Refresh the tcgetpgrp fallback here so a non-OSC-133
+                            // shell reports current `running` on every live drain
+                            // (e.g. right after a reattach) instead of a value left
+                            // stale since the last poll tick / attach.
+                            if !session.has_prompt_marking() && !session.is_dead() {
+                                poll_running = session.poll_running();
+                            }
                             let eff = effective_status(&session, poll_running);
                             if last_status != Some(eff) {
                                 push_or_drop(&mut client, status_frame(eff));
