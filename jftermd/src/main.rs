@@ -13,7 +13,24 @@ struct Args {
     socket: Option<PathBuf>,
 }
 
-fn parse_args() -> Args {
+const USAGE: &str = "\
+jftermd - JFTerm session muxer daemon
+
+Usage: jftermd [OPTIONS]
+
+Options:
+  -f, --foreground    Run in the foreground (do not daemonize)
+      --socket <PATH> Path to the control socket
+  -h, --help          Print this help and exit";
+
+/// Outcome of parsing argv: run with the parsed args, or exit with a code
+/// after printing usage (`--help` -> success; a bad argument -> failure).
+enum ArgsOutcome {
+    Run(Args),
+    Exit(ExitCode),
+}
+
+fn parse_args() -> ArgsOutcome {
     let mut args = Args {
         foreground: false,
         socket: None,
@@ -22,11 +39,21 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--foreground" | "-f" => args.foreground = true,
-            "--socket" => args.socket = it.next().map(PathBuf::from),
+            "--socket" => match it.next() {
+                Some(path) => args.socket = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("jftermd: --socket requires a path argument");
+                    return ArgsOutcome::Exit(ExitCode::FAILURE);
+                }
+            },
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ArgsOutcome::Exit(ExitCode::SUCCESS);
+            }
             other => eprintln!("jftermd: ignoring unknown argument {other}"),
         }
     }
-    args
+    ArgsOutcome::Run(args)
 }
 
 fn init_tracing() {
@@ -49,7 +76,10 @@ async fn shutdown_signal() {
 }
 
 fn main() -> ExitCode {
-    let args = parse_args();
+    let args = match parse_args() {
+        ArgsOutcome::Run(args) => args,
+        ArgsOutcome::Exit(code) => return code,
+    };
     init_tracing();
 
     let sock = args.socket.unwrap_or_else(socket::default_socket_path);
