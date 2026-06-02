@@ -78,11 +78,7 @@ fn exit_frame(code: i32) -> Frame {
 /// client (forced/lazy detach). The shell is never stalled by this.
 fn push_or_drop(client: &mut Option<mpsc::Sender<Frame>>, frame: Frame) {
     let drop_it = match client.as_ref() {
-        Some(tx) => match tx.try_send(frame) {
-            Ok(()) => false,
-            Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => true,
-        },
+        Some(tx) => tx.try_send(frame).is_err(),
         None => false,
     };
     if drop_it {
