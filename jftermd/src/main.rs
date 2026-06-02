@@ -117,6 +117,11 @@ fn main() -> ExitCode {
     });
 
     let _ = std::fs::remove_file(&sock);
+    // Unlink the lockfile path on clean shutdown so it does not persist on
+    // disk. We still hold the flock fd (`_lock`) here; unlinking the path is
+    // independent of the open fd, and the flock is released when `_lock` drops
+    // immediately after.
+    let _ = std::fs::remove_file(&lock);
     // `_lock` (the held Flock) drops here, releasing the lockfile.
     ExitCode::SUCCESS
 }
