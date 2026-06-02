@@ -83,7 +83,12 @@ fn main() -> ExitCode {
     };
 
     if let Err(e) = socket::restrict_socket_perms(&sock) {
-        tracing::warn!(error = %e, "could not chmod socket to 0600");
+        // The umask(0o077) set in daemonize() already closes the bind->chmod
+        // window, but a chmod failure means we cannot prove the socket is 0600,
+        // so abort rather than serve a possibly world-accessible socket.
+        tracing::error!(error = %e, "could not chmod socket to 0600; aborting");
+        let _ = std::fs::remove_file(&sock);
+        return ExitCode::FAILURE;
     }
     if let Err(e) = listener.set_nonblocking(true) {
         tracing::error!(error = %e, "could not set listener non-blocking");
