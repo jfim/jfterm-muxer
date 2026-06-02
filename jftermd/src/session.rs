@@ -161,6 +161,21 @@ impl Session {
         self.pty.foreground_busy().unwrap_or(false)
     }
 
+    /// Effective/merged `running`, matching the semantics the server uses for
+    /// STATUS frames: the engine's OSC 133 value once prompt marking has been
+    /// seen, otherwise the tcgetpgrp poll fallback. A dead session is never
+    /// running.
+    pub fn effective_running(&self) -> bool {
+        if self.is_dead() {
+            return false;
+        }
+        if self.has_prompt_marking() {
+            self.engine.status().running
+        } else {
+            self.poll_running()
+        }
+    }
+
     /// Whether the shell uses OSC 133 prompt marking (engine latch).
     pub fn has_prompt_marking(&self) -> bool {
         self.engine.has_prompt_marking()
@@ -188,7 +203,7 @@ impl Session {
             session_id: self.id.clone(),
             argv: self.argv.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
-            running: !self.is_dead(),
+            running: self.effective_running(),
             has_client,
             created_at: self.created_at,
         }
@@ -277,7 +292,11 @@ mod tests {
         assert_eq!(info.session_id, "t4");
         assert_eq!(info.argv, argv(&["cat"]));
         assert_eq!(info.cwd, "/home");
-        assert!(info.running);
+        // `info.running` now reflects effective/merged running semantics, not
+        // mere liveness: `cat` is exec'd directly as the PTY session leader
+        // (no job-control shell, no OSC 133), so the foreground process group
+        // equals the leader and the tcgetpgrp fallback reports not-running.
+        assert!(!info.running);
         assert!(info.has_client);
     }
 

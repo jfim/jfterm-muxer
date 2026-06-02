@@ -239,18 +239,31 @@ async fn handle_control(
     }
 }
 
-/// Ask every live session actor for its `SessionInfo` (bounded by a timeout).
+/// Ask every live session actor for its `SessionInfo`, concurrently.
+///
+/// Dispatch every `Info` request first, collect the reply receivers, then await
+/// them all under a single overall timeout. The actors answer in parallel, so
+/// LIST latency is bounded by one timeout rather than scaling at 1s * N as it
+/// did when each actor was queried serially with its own per-actor timeout.
 async fn collect_sessions(registry: &Registry) -> Vec<SessionInfo> {
     let handles = registry.handles();
-    let mut out = Vec::with_capacity(handles.len());
+    let mut rxs = Vec::with_capacity(handles.len());
     for (_id, tx) in handles {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if tx.send(SessionCommand::Info(reply_tx)).await.is_ok()
-            && let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(1), reply_rx).await
-        {
-            out.push(info);
+        if tx.send(SessionCommand::Info(reply_tx)).await.is_ok() {
+            rxs.push(reply_rx);
         }
     }
+    let mut out = Vec::with_capacity(rxs.len());
+    let collect = async {
+        for rx in rxs {
+            if let Ok(info) = rx.await {
+                out.push(info);
+            }
+        }
+    };
+    // Single shared deadline across all replies (not per-actor).
+    let _ = tokio::time::timeout(Duration::from_secs(1), collect).await;
     out
 }
 
