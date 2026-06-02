@@ -71,7 +71,7 @@ impl Registry {
     /// and return the receiver for the caller to spawn an actor around. The
     /// whole check-and-insert happens under the lock with no `.await`.
     pub fn attach_or_create(&self, id: &str) -> Bind {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = map.get(id) {
             return Bind::Existing(h.cmd_tx.clone());
         }
@@ -90,14 +90,17 @@ impl Registry {
     pub fn get(&self, id: &str) -> Option<mpsc::Sender<SessionCommand>> {
         self.sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(id)
             .map(|h| h.cmd_tx.clone())
     }
 
     /// Remove a session (its actor is ending) and pulse the empty-notify.
     pub fn remove(&self, id: &str) {
-        self.sessions.lock().unwrap().remove(id);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
         self.ended.notify_one();
     }
 
@@ -105,14 +108,17 @@ impl Registry {
     pub fn handles(&self) -> Vec<(String, mpsc::Sender<SessionCommand>)> {
         self.sessions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|(k, v)| (k.clone(), v.cmd_tx.clone()))
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.lock().unwrap().is_empty()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Wait until the next session-set change.

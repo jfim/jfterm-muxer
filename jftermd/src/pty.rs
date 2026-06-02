@@ -101,7 +101,7 @@ impl Pty {
         // The lock confines the slave to one spawn at a time.
         static SPAWN_LOCK: Mutex<()> = Mutex::new(());
         let res = {
-            let _guard = SPAWN_LOCK.lock().unwrap();
+            let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: child path touches only async-signal-safe syscalls.
             unsafe { forkpty(Some(&ws), None) }.map_err(io_err)?
         };
