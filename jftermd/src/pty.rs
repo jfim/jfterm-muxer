@@ -12,7 +12,7 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{Pid, chdir, execvpe, getpgid, read, tcgetpgrp, write};
+use nix::unistd::{Pid, getpgid, read, tcgetpgrp, write};
 
 // TIOCSWINSZ ioctl for resizing the master after fork.
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
@@ -75,6 +75,24 @@ impl Pty {
         let cwd_c = CString::new(cwd.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+        // Build the NULL-terminated argv/envp pointer arrays in the PARENT so the
+        // child does ZERO heap allocation between fork and exec. `nix::execvpe`
+        // builds these arrays *inside the child* (`Vec::collect`), and `malloc` is
+        // not async-signal-safe: if another thread held the allocator lock at fork
+        // time the child would deadlock before exec. (SPAWN_LOCK below serializes
+        // the fork window but not other threads' allocations, so it does not cover
+        // this — calling raw `libc::execvpe` with parent-built arrays does.)
+        let argv_ptrs: Vec<*const libc::c_char> = argv_c
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let env_ptrs: Vec<*const libc::c_char> = env_c
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+
         // Serialize forkpty across threads. `forkpty` opens the slave, forks,
         // and closes the slave in the parent — none of those fds carry
         // O_CLOEXEC. If another thread forks during that window its child
@@ -100,10 +118,14 @@ impl Pty {
                 Ok(pty)
             }
             ForkptyResult::Child => {
-                let _ = chdir(cwd_c.as_c_str());
-                let _ = execvpe(&argv_c[0], &argv_c, &env_c);
-                // exec failed; child must not return into Rust.
-                unsafe { libc::_exit(127) };
+                // SAFETY: async-signal-safe libc calls only; the CStrings and
+                // pointer arrays were built in the parent and remain valid here.
+                unsafe {
+                    libc::chdir(cwd_c.as_ptr());
+                    libc::execvpe(argv_c[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+                    // exec failed; the child must not unwind back into Rust.
+                    libc::_exit(127);
+                }
             }
         }
     }
