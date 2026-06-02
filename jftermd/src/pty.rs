@@ -180,6 +180,11 @@ impl Pty {
         killpg(self.child, Signal::SIGHUP).map_err(io_err)
     }
 
+    /// SIGKILL the child's process group (CLOSE escalation).
+    pub fn kill(&self) -> io::Result<()> {
+        killpg(self.child, Signal::SIGKILL).map_err(io_err)
+    }
+
     /// Non-blocking reap. `Some(status)` once reaped (128+sig for signals),
     /// `None` while still running.
     pub fn try_reap(&self) -> io::Result<Option<i32>> {
@@ -305,5 +310,34 @@ mod tests {
         let pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
         pty.resize(winsize(120, 40)).expect("resize");
         pty.hangup().expect("hangup");
+    }
+
+    #[test]
+    fn kill_terminates_and_reaps_as_sigkill() {
+        let mut pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
+        pty.kill().expect("kill");
+        // Drain to EOF, then reap: SIGKILL surfaces as 128 + 9 = 137.
+        let start = Instant::now();
+        loop {
+            let d = pty.drain().expect("drain");
+            if d.eof {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "no EOF after SIGKILL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut status = None;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if let Some(s) = pty.try_reap().expect("reap") {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(status, Some(137));
     }
 }

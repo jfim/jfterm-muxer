@@ -147,6 +147,22 @@ impl Session {
         self.engine.status()
     }
 
+    /// SIGHUP the shell's process group (no-op once dead).
+    pub fn hangup(&self) -> io::Result<()> {
+        if self.is_dead() {
+            return Ok(());
+        }
+        self.pty.hangup()
+    }
+
+    /// SIGKILL the shell's process group (no-op once dead).
+    pub fn kill(&self) -> io::Result<()> {
+        if self.is_dead() {
+            return Ok(());
+        }
+        self.pty.kill()
+    }
+
     /// Kill the shell (SIGHUP), reap, and mark dead. Idempotent.
     pub fn close(&mut self) -> io::Result<i32> {
         if let Lifecycle::Dead { status } = self.lifecycle {
