@@ -71,7 +71,13 @@ pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire>
 /// multi-thread runtime exists would leave the child with a broken runtime
 /// (locks held by threads that no longer exist).
 pub fn daemonize() -> io::Result<()> {
+    use nix::sys::stat::{Mode, umask};
     use nix::unistd::{ForkResult, chdir, fork, setsid};
+
+    // Force a restrictive umask so the inherited umask cannot loosen the modes
+    // of the socket or any child-created files. This runs before the socket
+    // bind path, narrowing the bind->chmod window to 0600-or-tighter.
+    umask(Mode::from_bits_truncate(0o077));
 
     // SAFETY: between fork and the next exec/_exit we touch only
     // async-signal-safe calls; the parent simply exits.
