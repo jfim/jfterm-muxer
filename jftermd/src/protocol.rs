@@ -176,6 +176,13 @@ pub struct Resize {
     pub rows: u16,
 }
 
+/// `Close` value — SIGHUP the shell, then SIGKILL after `grace_ms` if still
+/// alive. `grace_ms == 0` = SIGHUP only (no escalation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseMsg {
+    pub grace_ms: u32,
+}
+
 /// `Status` value — semantic dot state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusMsg {
@@ -332,5 +339,15 @@ mod tests {
     #[test]
     fn frame_data_empty_input_yields_no_frames() {
         assert!(frame_data(&[]).is_empty());
+    }
+
+    #[test]
+    fn close_msg_round_trips() {
+        for grace_ms in [0u32, 1500, u32::MAX] {
+            let msg = CloseMsg { grace_ms };
+            let frame = Frame::control(FrameType::Close, &msg).unwrap();
+            assert_eq!(frame.ty, FrameType::Close);
+            assert_eq!(frame.json::<CloseMsg>().unwrap(), msg);
+        }
     }
 }

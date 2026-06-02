@@ -12,7 +12,7 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{Pid, chdir, execvpe, getpgid, read, write};
+use nix::unistd::{Pid, getpgid, read, tcgetpgrp, write};
 
 // TIOCSWINSZ ioctl for resizing the master after fork.
 nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
@@ -63,14 +63,35 @@ impl Pty {
         if argv_c.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
         }
+        // Force the emulator-capability vars; drop any inherited values so they
+        // can't override what JFTerm's terminal actually supports.
         let mut env_c: Vec<CString> = std::env::vars()
-            .filter(|(k, _)| k != "TERM")
+            .filter(|(k, _)| k != "TERM" && k != "COLORTERM")
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         env_c.push(CString::new("TERM=xterm-256color").unwrap());
+        env_c.push(CString::new("COLORTERM=truecolor").unwrap());
         let cwd_c = CString::new(cwd.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // Build the NULL-terminated argv/envp pointer arrays in the PARENT so the
+        // child does ZERO heap allocation between fork and exec. `nix::execvpe`
+        // builds these arrays *inside the child* (`Vec::collect`), and `malloc` is
+        // not async-signal-safe: if another thread held the allocator lock at fork
+        // time the child would deadlock before exec. (SPAWN_LOCK below serializes
+        // the fork window but not other threads' allocations, so it does not cover
+        // this — calling raw `libc::execvpe` with parent-built arrays does.)
+        let argv_ptrs: Vec<*const libc::c_char> = argv_c
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let env_ptrs: Vec<*const libc::c_char> = env_c
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
 
         // Serialize forkpty across threads. `forkpty` opens the slave, forks,
         // and closes the slave in the parent — none of those fds carry
@@ -97,10 +118,14 @@ impl Pty {
                 Ok(pty)
             }
             ForkptyResult::Child => {
-                let _ = chdir(cwd_c.as_c_str());
-                let _ = execvpe(&argv_c[0], &argv_c, &env_c);
-                // exec failed; child must not return into Rust.
-                unsafe { libc::_exit(127) };
+                // SAFETY: async-signal-safe libc calls only; the CStrings and
+                // pointer arrays were built in the parent and remain valid here.
+                unsafe {
+                    libc::chdir(cwd_c.as_ptr());
+                    libc::execvpe(argv_c[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+                    // exec failed; the child must not unwind back into Rust.
+                    libc::_exit(127);
+                }
             }
         }
     }
@@ -172,9 +197,23 @@ impl Pty {
         killpg(self.child, Signal::SIGWINCH).map_err(io_err)
     }
 
+    /// True when a foreground process group other than the shell itself owns the
+    /// terminal — i.e. a command is running. The `running` fallback for shells
+    /// without OSC 133. (Only ever true under an interactive, job-control shell;
+    /// a non-job-control `sh -c` keeps everything in the leader's group.)
+    pub fn foreground_busy(&self) -> io::Result<bool> {
+        let fg = tcgetpgrp(&self.master).map_err(io_err)?;
+        Ok(fg != self.child)
+    }
+
     /// SIGHUP the child's process group (Close).
     pub fn hangup(&self) -> io::Result<()> {
         killpg(self.child, Signal::SIGHUP).map_err(io_err)
+    }
+
+    /// SIGKILL the child's process group (CLOSE escalation).
+    pub fn kill(&self) -> io::Result<()> {
+        killpg(self.child, Signal::SIGKILL).map_err(io_err)
     }
 
     /// Non-blocking reap. `Some(status)` once reaped (128+sig for signals),
@@ -245,6 +284,22 @@ mod tests {
     }
 
     #[test]
+    fn echoes_colorterm_truecolor() {
+        let mut pty = Pty::spawn(
+            &argv(&["sh", "-c", "printf %s \"$COLORTERM\""]),
+            Path::new("/"),
+            winsize(80, 24),
+        )
+        .expect("spawn");
+        let out = read_until(&mut pty, b"truecolor", Duration::from_secs(3));
+        assert!(
+            out.windows(9).any(|w| w == b"truecolor"),
+            "COLORTERM not set; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
     fn write_input_reaches_the_shell() {
         let mut pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
         pty.write_input(b"ping\n").expect("write");
@@ -286,5 +341,52 @@ mod tests {
         let pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
         pty.resize(winsize(120, 40)).expect("resize");
         pty.hangup().expect("hangup");
+    }
+
+    #[test]
+    fn foreground_not_busy_at_prompt() {
+        let mut pty = Pty::spawn(
+            &argv(&["bash", "--norc", "-i"]),
+            Path::new("/"),
+            winsize(80, 24),
+        )
+        .expect("spawn");
+        // Let bash take the terminal and print its prompt.
+        let _ = read_until(&mut pty, b"$", Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !pty.foreground_busy().expect("tcgetpgrp"),
+            "a shell at its prompt should not be foreground-busy"
+        );
+        pty.hangup().ok();
+    }
+
+    #[test]
+    fn kill_terminates_and_reaps_as_sigkill() {
+        let mut pty = Pty::spawn(&argv(&["cat"]), Path::new("/"), winsize(80, 24)).expect("spawn");
+        pty.kill().expect("kill");
+        // Drain to EOF, then reap: SIGKILL surfaces as 128 + 9 = 137.
+        let start = Instant::now();
+        loop {
+            let d = pty.drain().expect("drain");
+            if d.eof {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "no EOF after SIGKILL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut status = None;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if let Some(s) = pty.try_reap().expect("reap") {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(status, Some(137));
     }
 }

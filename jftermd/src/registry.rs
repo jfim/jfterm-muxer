@@ -16,8 +16,9 @@ pub enum SessionCommand {
     Input(Vec<u8>),
     /// Client resize (`RESIZE`).
     Resize { cols: u16, rows: u16 },
-    /// Kill the shell and drop the session (`CLOSE`).
-    Close,
+    /// Kill the shell and drop the session (`CLOSE`): SIGHUP, then SIGKILL after
+    /// `grace_ms` if still alive (`grace_ms == 0` = SIGHUP only).
+    Close { grace_ms: u32 },
     /// A (re)attach: most-recent-wins takeover of the session's single client.
     Attach(AttachRequest),
     /// Snapshot request for the control connection's `LIST`.

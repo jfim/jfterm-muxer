@@ -147,28 +147,33 @@ impl Session {
         self.engine.status()
     }
 
-    /// Kill the shell (SIGHUP), reap, and mark dead. Idempotent.
-    pub fn close(&mut self) -> io::Result<i32> {
-        if let Lifecycle::Dead { status } = self.lifecycle {
-            return Ok(status);
+    /// `running` fallback via tcgetpgrp (false once dead).
+    pub fn poll_running(&self) -> bool {
+        if self.is_dead() {
+            return false;
         }
-        self.pty.hangup()?;
-        // Drain any final output into the engine before reaping.
-        if let Ok(final_out) = self.pty.drain()
-            && !final_out.bytes.is_empty()
-        {
-            self.engine.feed(&final_out.bytes);
+        self.pty.foreground_busy().unwrap_or(false)
+    }
+
+    /// Whether the shell uses OSC 133 prompt marking (engine latch).
+    pub fn has_prompt_marking(&self) -> bool {
+        self.engine.has_prompt_marking()
+    }
+
+    /// SIGHUP the shell's process group (no-op once dead).
+    pub fn hangup(&self) -> io::Result<()> {
+        if self.is_dead() {
+            return Ok(());
         }
-        let mut status = 0;
-        for _ in 0..200 {
-            if let Some(s) = self.pty.try_reap()? {
-                status = s;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        self.pty.hangup()
+    }
+
+    /// SIGKILL the shell's process group (no-op once dead).
+    pub fn kill(&self) -> io::Result<()> {
+        if self.is_dead() {
+            return Ok(());
         }
-        self.lifecycle = Lifecycle::Dead { status };
-        Ok(status)
+        self.pty.kill()
     }
 
     /// Snapshot for the `List`/`Sessions` control reply.
@@ -271,37 +276,31 @@ mod tests {
     }
 
     #[test]
-    fn close_feeds_final_output_into_replay() {
-        // Shell prints a line then waits on stdin; close() must capture that
-        // final output into the replay even though we never drained it live.
+    fn draining_osc133_latches_has_prompt_marking() {
+        // A shell that emits an OSC 133 marker should latch prompt marking once
+        // its output is drained into the engine — which is what permanently
+        // disables the daemon's tcgetpgrp `running` fallback. (The 133 sequence
+        // itself is stripped from the replay, so we poll `has_prompt_marking`.)
         let mut s = Session::open(
-            "tclose",
-            argv(&["sh", "-c", "echo final-banner; exec cat"]),
+            "t133",
+            argv(&["sh", "-c", "printf '\\033]133;D\\007'; sleep 0.3"]),
             "/",
             80,
             24,
         )
         .expect("open");
-        // Give the shell a moment to emit the banner (do NOT drain it here).
-        std::thread::sleep(Duration::from_millis(200));
-        s.close().expect("close");
-        let replay = s.replay_for_attach(0);
+        assert!(!s.has_prompt_marking());
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            let _ = s.drain().expect("drain");
+            if s.has_prompt_marking() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
-            replay.data.windows(12).any(|w| w == b"final-banner"),
-            "close() did not feed final output into replay; got {:?}",
-            String::from_utf8_lossy(&replay.data)
-        );
-    }
-
-    #[test]
-    fn close_kills_and_reaps() {
-        let mut s = Session::open("t5", argv(&["cat"]), "/", 80, 24).expect("open");
-        let status = s.close().expect("close");
-        assert!(s.is_dead());
-        // SIGHUP-terminated `cat` reaps as 128+1 (SIGHUP) or 0 if it raced.
-        assert!(
-            status == 129 || status == 0,
-            "unexpected close status {status}"
+            s.has_prompt_marking(),
+            "draining OSC 133 output should latch prompt marking (engine becomes authoritative)"
         );
     }
 }

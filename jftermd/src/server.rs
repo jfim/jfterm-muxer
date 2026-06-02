@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use crate::protocol::{
-    AttachOrOpen, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, ProtocolError,
-    Resize, SessionInfo, StatusMsg, frame_data,
+    AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
+    ProtocolError, Resize, SessionInfo, StatusMsg, frame_data,
 };
 use crate::registry::{AttachRequest, Bind, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
@@ -34,6 +34,8 @@ pub struct ServerOpts {
     pub exit_grace: Duration,
     /// Bounded per-client out-queue depth; overflow forces a detach.
     pub out_queue: usize,
+    /// Interval for the tcgetpgrp `running` fallback poll (non-OSC-133 shells).
+    pub status_poll: Duration,
 }
 
 impl Default for ServerOpts {
@@ -42,6 +44,7 @@ impl Default for ServerOpts {
             dead_grace: Duration::from_secs(30),
             exit_grace: Duration::from_secs(5),
             out_queue: 1024,
+            status_poll: Duration::from_millis(300),
         }
     }
 }
@@ -103,6 +106,7 @@ fn forward_data(client: &mut Option<mpsc::Sender<Frame>>, data: &[u8]) {
 fn attach_client(
     session: &mut Session,
     client: &mut Option<mpsc::Sender<Frame>>,
+    poll_running: bool,
     req: AttachRequest,
 ) {
     let _ = session.resize(req.cols, req.rows);
@@ -110,7 +114,9 @@ fn attach_client(
     for f in frame_data(&replay.data) {
         let _ = req.out_tx.try_send(f);
     }
-    let _ = req.out_tx.try_send(status_frame(replay.status));
+    let _ = req
+        .out_tx
+        .try_send(status_frame(effective_status(session, poll_running)));
     if let Lifecycle::Dead { status } = session.lifecycle() {
         let _ = req.out_tx.try_send(exit_frame(status));
     }
@@ -248,6 +254,26 @@ async fn collect_sessions(registry: &Registry) -> Vec<SessionInfo> {
     out
 }
 
+/// Effective `running`: the engine's value once the shell has shown OSC 133
+/// prompt marking, otherwise the tcgetpgrp poll value.
+fn merge_running(has_marking: bool, engine_running: bool, poll_running: bool) -> bool {
+    if has_marking {
+        engine_running
+    } else {
+        poll_running
+    }
+}
+
+/// Build the STATUS snapshot the client should see: merged `running`, engine
+/// `progress`.
+fn effective_status(session: &Session, poll_running: bool) -> StatusSnapshot {
+    let snap = session.status();
+    StatusSnapshot {
+        running: merge_running(session.has_prompt_marking(), snap.running, poll_running),
+        progress: snap.progress,
+    }
+}
+
 /// The per-session actor: owns the `Session`, drains the PTY, and forwards
 /// frames to at most one client. Returns when the session ends; always removes
 /// itself from the registry on the way out.
@@ -278,10 +304,19 @@ pub(crate) async fn actor_loop(
     // just before the takeover would linger in the old client's socket buffer
     // and defeat the "next recv is EOF" contract.
     let mut last_status: Option<StatusSnapshot> = None;
+    // Latest tcgetpgrp fallback result (used until OSC 133 prompt marking shows).
+    let mut poll_running = false;
+    let mut poll = tokio::time::interval(opts.status_poll);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Set only after the child exits (dead-session retention deadline). `Instant`
     // is `Copy`, so the timer arm captures it by value — no borrow conflict with
     // the readable arm that reassigns it.
     let mut grace_deadline: Option<Instant> = None;
+    // Set once a CLOSE arrives; the next exit-detecting drain ends the actor
+    // (instead of arming dead-session retention).
+    let mut closing = false;
+    // Set on CLOSE{grace_ms>0}: SIGKILL-escalation deadline.
+    let mut kill_deadline: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -299,38 +334,38 @@ pub(crate) async fn actor_loop(
                     Some(SessionCommand::Info(reply)) => {
                         let _ = reply.send(session.info(client.is_some()));
                     }
-                    Some(SessionCommand::Close) => {
-                        // close() blocks (SIGHUP + bounded reap spin); run it off
-                        // the loop. If the blocking task panics the session is
-                        // lost, but we still fall through to break -> the
-                        // `registry.remove` below cleans up the handle so a panic
-                        // can never leak a session id.
-                        match tokio::task::spawn_blocking(move || {
-                            let _ = session.close();
-                            session
-                        })
-                        .await
-                        {
-                            Ok(closed) => {
-                                let code = match closed.lifecycle() {
-                                    Lifecycle::Dead { status } => status,
-                                    Lifecycle::Live => 0,
-                                };
-                                if let Some(tx) = client.take() {
-                                    let _ = tx.try_send(exit_frame(code));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(%id, error = %e, "close task panicked");
-                            }
+                    Some(SessionCommand::Close { grace_ms }) => {
+                        // Force-close: SIGHUP the group now (non-blocking); if it
+                        // is still alive at the deadline, escalate to SIGKILL.
+                        // Reaping stays EOF-driven (the readable arm); we keep the
+                        // session in the registry until reaped so idle self-exit
+                        // can't fire mid-reap and orphan the child.
+                        let _ = session.hangup();
+                        closing = true;
+                        if grace_ms > 0 {
+                            kill_deadline =
+                                Some(Instant::now() + Duration::from_millis(grace_ms as u64));
                         }
-                        break;
+                        if session.is_dead() {
+                            // Raced (already gone): tell any client and end now.
+                            let code = match session.lifecycle() {
+                                Lifecycle::Dead { status } => status,
+                                Lifecycle::Live => 0,
+                            };
+                            if let Some(tx) = client.take() {
+                                let _ = tx.try_send(exit_frame(code));
+                            }
+                            break;
+                        }
                     }
                     Some(SessionCommand::Attach(req)) => {
-                        attach_client(&mut session, &mut client, req);
+                        if !session.has_prompt_marking() {
+                            poll_running = session.poll_running();
+                        }
+                        attach_client(&mut session, &mut client, poll_running, req);
                         // The replay already carried a fresh STATUS to the new
                         // client; record it so live drains don't re-send it.
-                        last_status = Some(session.status());
+                        last_status = Some(effective_status(&session, poll_running));
                         if session.is_dead() {
                             // Final output + EXIT already queued; flush by ending.
                             break;
@@ -353,12 +388,16 @@ pub(crate) async fn actor_loop(
                         if !outcome.data.is_empty() {
                             forward_data(&mut client, &outcome.data);
                         }
-                        if last_status != Some(outcome.status) {
-                            push_or_drop(&mut client, status_frame(outcome.status));
-                            last_status = Some(outcome.status);
+                        let eff = effective_status(&session, poll_running);
+                        if last_status != Some(eff) {
+                            push_or_drop(&mut client, status_frame(eff));
+                            last_status = Some(eff);
                         }
                         if let Some(code) = outcome.exit {
                             push_or_drop(&mut client, exit_frame(code));
+                            if closing {
+                                break; // reaped after CLOSE -> end + registry.remove
+                            }
                             grace_deadline = Some(Instant::now() + opts.dead_grace);
                         }
                     }
@@ -376,6 +415,35 @@ pub(crate) async fn actor_loop(
                 }
             }, if grace_deadline.is_some() => {
                 break;
+            }
+
+            () = async {
+                match kill_deadline {
+                    Some(d) => sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if kill_deadline.is_some() => {
+                // Grace elapsed; if still not reaped, force-kill the whole group.
+                // Fire once — the readable arm then sees EOF -> reap -> break.
+                if !session.is_dead() {
+                    let _ = session.kill();
+                }
+                kill_deadline = None;
+            }
+
+            // Attach-gated `running` fallback for shells without OSC 133. This is
+            // best-effort: a foreground command shorter than `status_poll` can
+            // start and finish between ticks and never be seen as running.
+            _ = poll.tick(), if client.is_some()
+                && !session.is_dead()
+                && !session.has_prompt_marking() =>
+            {
+                poll_running = session.poll_running();
+                let eff = effective_status(&session, poll_running);
+                if last_status != Some(eff) {
+                    push_or_drop(&mut client, status_frame(eff));
+                    last_status = Some(eff);
+                }
             }
         }
     }
@@ -514,7 +582,9 @@ async fn reader_task(
                         }
                     }
                     FrameType::Close => {
-                        let _ = cmd_tx.send(SessionCommand::Close).await;
+                        // Empty or malformed payload defaults to grace_ms = 0.
+                        let grace_ms = frame.json::<CloseMsg>().map(|m| m.grace_ms).unwrap_or(0);
+                        let _ = cmd_tx.send(SessionCommand::Close { grace_ms }).await;
                         break 'outer;
                     }
                     other => tracing::warn!(?other, "unexpected session frame; ignoring"),
@@ -598,6 +668,14 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn merge_running_prefers_engine_when_marked_else_poll() {
+        assert!(super::merge_running(true, true, false)); // marked -> engine
+        assert!(!super::merge_running(true, false, true)); // marked -> engine
+        assert!(super::merge_running(false, false, true)); // unmarked -> poll
+        assert!(!super::merge_running(false, true, false)); // unmarked -> poll
+    }
+
     #[tokio::test]
     async fn actor_attaches_forwards_input_and_closes() {
         let reg = Registry::new();
@@ -651,7 +729,10 @@ mod tests {
         let got = collect_data_until(&mut out_rx, b"PING", Duration::from_secs(3)).await;
         assert!(contains(&got, b"PING"), "input did not round-trip");
 
-        cmd_tx.send(SessionCommand::Close).await.unwrap();
+        cmd_tx
+            .send(SessionCommand::Close { grace_ms: 0 })
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(3), task)
             .await
             .expect("actor should end after Close")
