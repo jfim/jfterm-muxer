@@ -170,12 +170,33 @@ pub async fn run(listener: UnixListener, registry: Arc<Registry>, opts: ServerOp
     }
 }
 
+/// Reject any peer whose uid is not the daemon's own uid, read from the kernel
+/// via `SO_PEERCRED`. This makes peer identity — not the best-effort socket
+/// file mode — the authoritative gate: the filesystem perms become
+/// defense-in-depth rather than the sole barrier. Same-uid is inside the trust
+/// boundary for a per-user daemon, so a same-uid peer is allowed.
+fn check_peer_uid<F: std::os::fd::AsFd>(conn: &F) -> io::Result<()> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let peer = getsockopt(conn, PeerCredentials)?;
+    // SAFETY: getuid is always safe (matches the existing use in daemonize.rs).
+    let me = unsafe { libc::getuid() };
+    if peer.uid() != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("rejecting connection from uid {} (daemon uid {me})", peer.uid()),
+        ));
+    }
+    Ok(())
+}
+
 /// Classify a connection by its first frame.
 async fn dispatch_connection(
     stream: UnixStream,
     registry: Arc<Registry>,
     opts: ServerOpts,
 ) -> io::Result<()> {
+    // Authenticate the peer before reading a single byte of protocol.
+    check_peer_uid(&stream)?;
     let (mut rh, wh) = stream.into_split();
     let mut dec = FrameDecoder::new();
     let first = match read_one_frame(&mut rh, &mut dec).await? {
@@ -689,6 +710,15 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn peer_uid_check_accepts_same_uid_socket() {
+        // A socketpair is created by this process, so both ends report our own
+        // uid via SO_PEERCRED -> the check must accept it.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(super::check_peer_uid(&a).is_ok());
+        assert!(super::check_peer_uid(&b).is_ok());
     }
 
     #[test]
