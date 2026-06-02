@@ -216,6 +216,11 @@ pub struct Scanner {
     ring: ChunkRing,
     /// Raw bytes of the span currently being parsed (not yet classified).
     pending: Vec<u8>,
+    /// Number of UTF-8 continuation bytes still expected for the multibyte
+    /// character currently being read. While non-zero the next bytes are
+    /// continuation bytes (0x80..=0xBF) and must pass through verbatim — in
+    /// particular 0x9C must NOT be reinterpreted as the C1 ST terminator.
+    utf8_remaining: u8,
 }
 
 impl Scanner {
@@ -225,26 +230,43 @@ impl Scanner {
             sink: Sink::new(),
             ring: ChunkRing::new(watermark),
             pending: Vec::new(),
+            utf8_remaining: 0,
         }
     }
 
     /// Feed a chunk of raw terminal output.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
+            // A 0x9C byte is ambiguous: it is the 8-bit C1 ST terminator, but
+            // it is also a legal UTF-8 continuation byte. Only a *standalone*
+            // 0x9C (not part of a multibyte character) is a C1 ST.
+            if self.utf8_remaining > 0 {
+                // Continuation byte of a multibyte character: pass through
+                // verbatim so 0x9C inside e.g. ✓ (E2 9C 93) is not mangled.
+                self.utf8_remaining -= 1;
+                self.advance_one(b);
+                continue;
+            }
+            // Ground byte: note any UTF-8 lead so the following continuation
+            // bytes are passed through verbatim above.
+            self.utf8_remaining = match b {
+                0xc2..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf4 => 3,
+                _ => 0,
+            };
             // vte 0.15 only supports 7-bit codes and does not recognise the
             // 8-bit C1 ST byte (0x9C) as an OSC/DCS string terminator; it
             // silently appends 0x9C to the OSC body and stays in OscString
-            // state, swallowing the byte that follows.  Translate 0x9C to the
-            // semantically identical 7-bit two-byte form ESC \ before the byte
-            // reaches vte.  The pending accumulator records 0x1B + 0x5C so the
-            // emitted span is equivalent to what `ESC \` would have produced.
-            let expanded: &[u8] = if b == 0x9c {
-                b"\x1b\\"
+            // state, swallowing the byte that follows.  Translate a standalone
+            // 0x9C to the semantically identical 7-bit two-byte form ESC \
+            // before the byte reaches vte. The pending accumulator records
+            // 0x1B + 0x5C so the emitted span is equivalent to `ESC \`.
+            if b == 0x9c {
+                self.advance_one(0x1b);
+                self.advance_one(0x5c);
             } else {
-                std::slice::from_ref(&b)
-            };
-            for &eb in expanded {
-                self.advance_one(eb);
+                self.advance_one(b);
             }
         }
     }
@@ -424,6 +446,18 @@ mod tests {
         // Title kept; X kept. (Exact terminator bytes in the ring may vary; the
         // invariant under test is that X survives and the title was tracked.)
         assert!(s.replay(usize::MAX).ends_with(b"X"));
+    }
+
+    #[test]
+    fn utf8_chars_with_0x9c_continuation_byte_survive_replay() {
+        // 0x9C is the C1 ST byte, but it is also a valid UTF-8 continuation
+        // byte. The scanner must not rewrite it to `ESC \` when it is part of a
+        // multibyte character, or the character is corrupted in the replay.
+        //   ✓ = U+2713 = E2 9C 93  (0x9C is the middle continuation byte)
+        //   ├ = U+251C = E2 94 9C  (0x9C is the trailing continuation byte)
+        let input = "café ✓ ─│├".as_bytes();
+        let s = feed(input);
+        assert_eq!(s.replay(usize::MAX), input.to_vec());
     }
 
     #[test]
