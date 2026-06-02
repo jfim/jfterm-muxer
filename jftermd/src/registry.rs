@@ -39,7 +39,7 @@ pub struct AttachRequest {
 /// Registry-side handle to one session actor.
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
-    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    pub(crate) cmd_tx: mpsc::Sender<SessionCommand>,
 }
 
 /// The shared session table.
@@ -86,15 +86,6 @@ impl Registry {
         Bind::Created { cmd_tx, cmd_rx }
     }
 
-    /// Look up an existing session's channel (no creation).
-    pub fn get(&self, id: &str) -> Option<mpsc::Sender<SessionCommand>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .map(|h| h.cmd_tx.clone())
-    }
-
     /// Remove a session (its actor is ending) and pulse the empty-notify.
     pub fn remove(&self, id: &str) {
         self.sessions
@@ -138,11 +129,11 @@ mod tests {
         let bind = reg.attach_or_create("s1");
         assert!(matches!(bind, Bind::Created { .. }));
         assert!(!reg.is_empty());
-        assert!(reg.get("s1").is_some());
+        assert!(reg.handles().iter().any(|(id, _)| id == "s1"));
         assert_eq!(reg.handles().len(), 1);
         reg.remove("s1");
         assert!(reg.is_empty());
-        assert!(reg.get("s1").is_none());
+        assert!(reg.handles().iter().all(|(id, _)| id != "s1"));
     }
 
     #[test]
