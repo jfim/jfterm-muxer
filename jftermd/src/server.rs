@@ -388,10 +388,14 @@ pub(crate) async fn actor_loop(
                         if !outcome.data.is_empty() {
                             forward_data(&mut client, &outcome.data);
                         }
-                        let eff = effective_status(&session, poll_running);
-                        if last_status != Some(eff) {
-                            push_or_drop(&mut client, status_frame(eff));
-                            last_status = Some(eff);
+                        // When detached, forward_data/push_or_drop below are
+                        // no-ops, so skip recomputing the merged status entirely.
+                        if client.is_some() {
+                            let eff = effective_status(&session, poll_running);
+                            if last_status != Some(eff) {
+                                push_or_drop(&mut client, status_frame(eff));
+                                last_status = Some(eff);
+                            }
                         }
                         if let Some(code) = outcome.exit {
                             push_or_drop(&mut client, exit_frame(code));
