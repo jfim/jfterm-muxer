@@ -6,8 +6,9 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::Mutex;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{ForkptyResult, Winsize, forkpty};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -71,11 +72,26 @@ impl Pty {
         let cwd_c = CString::new(cwd.as_os_str().as_encoded_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        // SAFETY: child path touches only async-signal-safe syscalls.
-        let res = unsafe { forkpty(Some(&ws), None) }.map_err(io_err)?;
+        // Serialize forkpty across threads. `forkpty` opens the slave, forks,
+        // and closes the slave in the parent — none of those fds carry
+        // O_CLOEXEC. If another thread forks during that window its child
+        // inherits this session's slave fd and holds it open, so when our shell
+        // exits the master never reaches EOF and the exit is never detected.
+        // The lock confines the slave to one spawn at a time.
+        static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+        let res = {
+            let _guard = SPAWN_LOCK.lock().unwrap();
+            // SAFETY: child path touches only async-signal-safe syscalls.
+            unsafe { forkpty(Some(&ws), None) }.map_err(io_err)?
+        };
         match res {
             ForkptyResult::Parent { master, child } => {
                 set_nonblocking(&master)?;
+                // Close-on-exec so a later concurrent spawn's child does not
+                // inherit (and hold open) this master across its own exec. The
+                // SPAWN_LOCK above already prevents the slave from leaking; this
+                // keeps the long-lived master from leaking into siblings too.
+                set_cloexec(&master)?;
                 let pty = Self { master, child };
                 pty.await_own_process_group();
                 Ok(pty)
@@ -176,6 +192,11 @@ impl Pty {
 
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io_err)?;
+    Ok(())
+}
+
+fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io_err)?;
     Ok(())
 }
 
