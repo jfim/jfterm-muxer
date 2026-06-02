@@ -43,6 +43,7 @@ impl ChunkRing {
     /// True once the open chunk's data has reached the soft watermark. The
     /// scanner only acts on this at parser ground state, so a single long
     /// sequence is never split — the chunk simply grows past the watermark.
+    #[must_use]
     pub fn should_cut(&self) -> bool {
         self.chunks
             .last()

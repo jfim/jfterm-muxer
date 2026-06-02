@@ -23,17 +23,20 @@ impl ReplayEngine {
     }
 
     /// Full available replay (all chunks since the last purge boundary).
+    #[must_use]
     pub fn replay(&self) -> Vec<u8> {
         self.scanner.replay(usize::MAX)
     }
 
     /// Replay capped to the most recent `want_chunks` chunks (memory/scrollback
     /// dial; see spec). Modes stay correct via the prologue even when capped.
+    #[must_use]
     pub fn replay_capped(&self, want_chunks: usize) -> Vec<u8> {
         self.scanner.replay(want_chunks)
     }
 
     /// Current shell status for the `STATUS` wire frame.
+    #[must_use]
     pub fn status(&self) -> StatusSnapshot {
         self.scanner.status()
     }
@@ -41,6 +44,7 @@ impl ReplayEngine {
     /// Whether the shell uses OSC 133 prompt marking (latched on the first
     /// marker of any subtype). Until true, the daemon supplies `running` from a
     /// tcgetpgrp poll.
+    #[must_use]
     pub fn has_prompt_marking(&self) -> bool {
         self.scanner.saw_prompt_marker()
     }

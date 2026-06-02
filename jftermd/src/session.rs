@@ -137,6 +137,7 @@ impl Session {
 
     /// Produce the attach handshake replay. `want_chunks == 0` → full available
     /// scrollback (last purge boundary); otherwise cap to the most recent N.
+    #[must_use]
     pub fn replay_for_attach(&self, want_chunks: usize) -> AttachReplay {
         let data = if want_chunks == 0 {
             self.engine.replay()
@@ -154,6 +155,7 @@ impl Session {
     }
 
     /// `running` fallback via tcgetpgrp (false once dead).
+    #[must_use]
     pub fn poll_running(&self) -> bool {
         if self.is_dead() {
             return false;
@@ -198,6 +200,7 @@ impl Session {
     }
 
     /// Snapshot for the `List`/`Sessions` control reply.
+    #[must_use]
     pub fn info(&self, has_client: bool) -> SessionInfo {
         SessionInfo {
             session_id: self.id.clone(),
