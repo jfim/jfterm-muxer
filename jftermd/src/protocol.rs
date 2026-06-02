@@ -32,9 +32,12 @@ pub enum FrameType {
     Exit = 11,
 }
 
-impl FrameType {
-    fn from_u8(b: u8) -> Option<Self> {
-        Some(match b {
+impl TryFrom<u8> for FrameType {
+    /// The unrecognized byte, so callers can build `UnknownType(b)`.
+    type Error = u8;
+
+    fn try_from(b: u8) -> Result<Self, Self::Error> {
+        Ok(match b {
             1 => Self::Hello,
             2 => Self::HelloOk,
             3 => Self::List,
@@ -46,7 +49,7 @@ impl FrameType {
             9 => Self::Data,
             10 => Self::Status,
             11 => Self::Exit,
-            _ => return None,
+            _ => return Err(b),
         })
     }
 }
@@ -156,7 +159,7 @@ impl FrameDecoder {
         if len > MAX_FRAME_LEN {
             return Err(ProtocolError::FrameTooLarge(len));
         }
-        let ty = FrameType::from_u8(ty_byte).ok_or(ProtocolError::UnknownType(ty_byte))?;
+        let ty = FrameType::try_from(ty_byte).map_err(ProtocolError::UnknownType)?;
         let total = 5 + len as usize;
         if avail.len() < total {
             return Ok(None);
