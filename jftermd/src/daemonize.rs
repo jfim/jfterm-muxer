@@ -6,8 +6,17 @@ use std::io::{self, ErrorKind};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{Flock, FlockArg};
+
+/// How long a starting daemon waits for a predecessor to release the lockfile
+/// before concluding a live daemon genuinely owns it. A predecessor that has
+/// decided to exit releases the lock almost immediately (it only has to unlink
+/// its socket + lockfile), so this is generous headroom, not a steady-state
+/// cost. In a cold-start race the loser simply waits this out, then exits.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+const ACQUIRE_POLL: Duration = Duration::from_millis(20);
 
 /// Outcome of trying to become the daemon.
 // `main.rs` (Task 9) consumes `lock`/`listener`; until then only tests read
@@ -44,10 +53,30 @@ fn try_flock(lock_path: &Path) -> io::Result<Option<Flock<File>>> {
     }
 }
 
+/// Take the exclusive lockfile, waiting up to `ACQUIRE_TIMEOUT` for a
+/// predecessor to release it. This is what makes the daemon handoff safe: a
+/// daemon spawned while its predecessor is mid-teardown (socket already
+/// removed, lock about to drop) waits the lock out and then binds, instead of
+/// seeing momentary contention and exiting `AlreadyRunning` with no socket
+/// bound -- the "jftermd failed to start" race. Returns `None` only if the
+/// lock stays held for the whole window (a live daemon genuinely owns it).
+fn acquire_flock(lock_path: &Path) -> io::Result<Option<Flock<File>>> {
+    let deadline = Instant::now() + ACQUIRE_TIMEOUT;
+    loop {
+        if let Some(lock) = try_flock(lock_path)? {
+            return Ok(Some(lock));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(ACQUIRE_POLL);
+    }
+}
+
 /// Resolve the spawn race and bind the socket. Holding the lock makes us
 /// authoritative, so a leftover socket file is stale -> unlink + rebind.
 pub fn acquire_daemon(sock_path: &Path, lock_path: &Path) -> io::Result<Acquire> {
-    let lock = match try_flock(lock_path)? {
+    let lock = match acquire_flock(lock_path)? {
         Some(l) => l,
         None => return Ok(Acquire::AlreadyRunning),
     };
@@ -210,5 +239,40 @@ mod tests {
         drop(first);
         let again = acquire_daemon(&sock, &lock).unwrap();
         assert!(matches!(again, Acquire::Bound { .. }));
+    }
+
+    #[test]
+    fn successor_binds_after_predecessor_releases_during_teardown() {
+        // Reproduces the "jftermd failed to start" handoff race: a predecessor
+        // daemon, mid-teardown, has already removed its socket but still holds
+        // the lock for a moment. A successor spawned in that window must wait
+        // the lock out and bind -- NOT give up with AlreadyRunning, which would
+        // leave no connectable socket at all.
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("muxer.sock");
+        let lock = dir.path().join("muxer.lock");
+
+        let predecessor = acquire_daemon(&sock, &lock).unwrap();
+        assert!(matches!(predecessor, Acquire::Bound { .. }));
+        // Teardown step 1: the predecessor removes its socket while still
+        // holding the lock until it finishes exiting.
+        std::fs::remove_file(&sock).unwrap();
+        // Teardown finishes shortly after: drop the lock from another thread.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(predecessor);
+        });
+
+        let successor = acquire_daemon(&sock, &lock).unwrap();
+        assert!(
+            matches!(successor, Acquire::Bound { .. }),
+            "successor must bind once the predecessor releases, not exit AlreadyRunning"
+        );
+        assert!(
+            std::os::unix::net::UnixStream::connect(&sock).is_ok(),
+            "the handed-off socket must be connectable"
+        );
+        drop(successor);
     }
 }
