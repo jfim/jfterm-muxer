@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use crate::protocol::{
-    AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION,
-    Resize, SessionInfo, StatusMsg, frame_data,
+    AttachOrOpen, CloseMsg, ExitMsg, Frame, FrameDecoder, FrameType, Hello, PROTO_VERSION, Resize,
+    SessionInfo, StatusMsg, frame_data,
 };
 use crate::registry::{AttachRequest, Bind, MAX_SESSIONS, Registry, SessionCommand};
 use crate::session::{Lifecycle, Session};
@@ -183,7 +183,10 @@ fn check_peer_uid<F: std::os::fd::AsFd>(conn: &F) -> io::Result<()> {
     if peer.uid() != me {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("rejecting connection from uid {} (daemon uid {me})", peer.uid()),
+            format!(
+                "rejecting connection from uid {} (daemon uid {me})",
+                peer.uid()
+            ),
         ));
     }
     Ok(())

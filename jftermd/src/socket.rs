@@ -126,10 +126,7 @@ mod tests {
     fn ensure_socket_dir_refuses_loose_mode() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("jfterm");
-        std::fs::DirBuilder::new()
-            .mode(0o755)
-            .create(&dir)
-            .unwrap();
+        std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
         let sock = dir.join("muxer.sock");
         assert!(ensure_socket_dir(&sock).is_err());
     }
